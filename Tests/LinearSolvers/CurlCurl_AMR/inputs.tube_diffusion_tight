@@ -1,0 +1,51 @@
+# Tube-diffusion test, TIGHT refinement.
+#
+# Implicit resistive MHD time step on tube geometry:
+#   L E = curl B_initial
+#   L = dt * curl(curl) + (1/eta) * I  (variable eta)
+#
+# Refinement: annular ring r in [tube_r1 - tube_refine_band,
+# tube_r2 + tube_refine_band] (just the shell + buffer). With
+# nlevels=2 and the default composite=1, MLMG composite is expected
+# to FAIL to reduce the residual (hits max_iter, residual may
+# stagnate or grow). Append composite=0 to run the same problem in
+# level-by-level mode, which is expected to solve cleanly.
+
+problem = tube
+
+# Domain [-1, 1]^2
+prob_lo_x = -1.0
+prob_lo_y = -1.0
+prob_hi_x =  1.0
+prob_hi_y =  1.0
+
+# Grid: 128x128 coarse, 2 AMR levels.
+n_cell        = 128
+max_grid_size = 8
+ref_ratio     = 2
+nlevels       = 2
+
+# Tube geometry
+tube_r1          = 0.45
+tube_r2          = 0.5
+tube_eta         = 0.001
+tube_eta_FS      = 1000.0
+tube_alpha_aniso = 0.5
+tube_B0          = 1.0
+tube_dt          = 0.01
+
+# Refinement: annular ring, r in [0.40, 0.55]
+tube_refine_kind = annular
+tube_refine_band = 0.05
+
+# Solver
+verbose        = 2
+bottom_verbose = 0
+max_iter       = 500
+tol_rel        = 1.0e-7
+
+plot_dir = output/curlcurl_amr/tube_tight
+
+amrex.fpe_trap_invalid = 0
+amrex.fpe_trap_zero    = 0
+amrex.fpe_trap_overflow= 0

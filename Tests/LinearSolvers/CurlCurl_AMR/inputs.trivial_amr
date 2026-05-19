@@ -1,0 +1,24 @@
+n_cell = 64
+max_grid_size = 32
+ref_ratio = 2
+
+# Two AMR levels but the fine patch covers the entire coarse domain →
+# no coarse/fine interface inside the problem. Isolates the multi-level
+# transfer machinery from real CF coupling.
+nlevels = 2
+fine_box_lo = 0
+fine_box_hi = 63
+
+verbose = 2
+bottom_verbose = 0
+max_iter = 200
+tol_rel = 1.0e-10
+
+alpha = 1.0
+beta_profile = uniform
+
+plot_dir = output/curlcurl_amr/trivial_amr
+
+amrex.fpe_trap_invalid = 1
+amrex.fpe_trap_zero    = 1
+amrex.fpe_trap_overflow= 1

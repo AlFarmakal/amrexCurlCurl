@@ -1,0 +1,21 @@
+n_cell = 64
+max_grid_size = 32
+ref_ratio = 2
+
+# Two AMR levels with the default centered fine patch — real CF interface.
+nlevels = 2
+# fine_box_lo / fine_box_hi default to centered-half [n_cell/4, 3*n_cell/4-1].
+
+verbose = 2
+bottom_verbose = 0
+max_iter = 200
+tol_rel = 1.0e-10
+
+alpha = 1.0
+beta_profile = uniform
+
+plot_dir = output/curlcurl_amr/centered_amr
+
+amrex.fpe_trap_invalid = 1
+amrex.fpe_trap_zero    = 1
+amrex.fpe_trap_overflow= 1

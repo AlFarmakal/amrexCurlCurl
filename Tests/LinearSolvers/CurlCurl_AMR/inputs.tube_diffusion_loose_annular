@@ -1,0 +1,56 @@
+# Tube-diffusion test, LOOSE refinement with annular (jagged) edges.
+#
+# Same physical extent as inputs.tube_diffusion_loose (r out to ~0.8)
+# but with a stepped circular CF boundary instead of a clean square.
+#
+# The patch covers r in [0, tube_r2 + tube_refine_band] = [0, 0.80]
+# via tube_refine_kind = disk. This produces many CF corners and
+# greater CF surface area than the square-box variant, even though
+# the physical extent of the refined region is similar.
+#
+# Purpose: contrast against inputs.tube_diffusion_loose (clean box,
+# composite converges) and inputs.tube_diffusion_tight (annular
+# ring, composite diverges). Composite is expected to DIVERGE here
+# too, demonstrating that the divergence on tight grids is driven
+# by CF corner count / CF surface area, not by the eta jump or by
+# the size of the refined region. Append composite=0 to run the
+# same problem in level-by-level mode (expected to solve cleanly).
+
+problem = tube
+
+# Domain [-1, 1]^2
+prob_lo_x = -1.0
+prob_lo_y = -1.0
+prob_hi_x =  1.0
+prob_hi_y =  1.0
+
+# Grid: 128x128 coarse, 2 AMR levels.
+n_cell        = 128
+max_grid_size = 8
+ref_ratio     = 2
+nlevels       = 2
+
+# Tube geometry
+tube_r1          = 0.45
+tube_r2          = 0.5
+tube_eta         = 0.001
+tube_eta_FS      = 1000.0
+tube_alpha_aniso = 0.5
+tube_B0          = 1.0
+tube_dt          = 0.01
+
+# Refinement: disk, r in [0, 0.80] (stepped circular CF edge).
+tube_refine_kind = disk
+tube_refine_band = 0.3
+
+# Solver
+verbose        = 2
+bottom_verbose = 0
+max_iter       = 500
+tol_rel        = 1.0e-7
+
+plot_dir = output/curlcurl_amr/tube_loose_annular
+
+amrex.fpe_trap_invalid = 0
+amrex.fpe_trap_zero    = 0
+amrex.fpe_trap_overflow= 0

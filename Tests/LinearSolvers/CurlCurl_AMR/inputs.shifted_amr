@@ -1,0 +1,23 @@
+n_cell = 64
+max_grid_size = 32
+ref_ratio = 2
+
+# Fine patch shifted off-center: covers coarse cells [8, 39] in each dir.
+# CF interfaces at coarse x=8 (=0.125), x=40 (=0.625), same in y.
+nlevels = 2
+fine_box_lo = 8
+fine_box_hi = 39
+
+verbose = 2
+bottom_verbose = 0
+max_iter = 200
+tol_rel = 1.0e-10
+
+alpha = 1.0
+beta_profile = uniform
+
+plot_dir = output/curlcurl_amr/shifted_amr_level
+
+amrex.fpe_trap_invalid = 1
+amrex.fpe_trap_zero    = 1
+amrex.fpe_trap_overflow= 1

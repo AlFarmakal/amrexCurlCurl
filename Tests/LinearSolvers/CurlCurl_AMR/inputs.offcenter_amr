@@ -1,0 +1,23 @@
+n_cell = 64
+max_grid_size = 32
+ref_ratio = 2
+
+# Off-center fine box with buffer >= 12 on both sides.
+# Avoids the prior-session-known pathology where composite gives wrong
+# answers when a CF interface is too close to the periodic domain
+# boundary (buffer < 12 coarse cells).
+nlevels = 2
+fine_box_lo = 12
+fine_box_hi = 51
+
+verbose = 2
+bottom_verbose = 0
+max_iter = 200
+tol_rel = 1.0e-10
+
+alpha = 1.0
+beta_profile = uniform
+
+amrex.fpe_trap_invalid = 1
+amrex.fpe_trap_zero    = 1
+amrex.fpe_trap_overflow= 1

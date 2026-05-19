@@ -1,0 +1,60 @@
+# Tube-diffusion test, LOOSE refinement.
+#
+# Implicit resistive MHD time step on tube geometry:
+#   L E = curl B_initial
+#   L = dt * curl(curl) + (1/eta) * I  (variable eta)
+#
+# Refinement: square box covering [-0.6, 0.6] x [-0.6, 0.6], i.e.
+# tube interior + shell + buffer with straight coarse/fine edges
+# (only 4 CF corners, low CF surface area).
+# With nlevels=2 and the default composite=1, MLMG composite is
+# expected to CONVERGE on this geometry. To run the same problem
+# in level-by-level mode, append composite=0 on the command line.
+
+problem = tube
+
+# Domain [-1, 1]^2
+prob_lo_x = -1.0
+prob_lo_y = -1.0
+prob_hi_x =  1.0
+prob_hi_y =  1.0
+
+# Grid: 128x128 coarse, 2 AMR levels.
+n_cell        = 128
+max_grid_size = 8
+ref_ratio     = 2
+nlevels       = 2
+
+# Tube geometry
+tube_r1          = 0.45
+tube_r2          = 0.5
+tube_eta         = 0.001     # eta inside tube wall
+tube_eta_FS      = 1000.0    # eta in free space (6-OOM contrast)
+tube_alpha_aniso = 0.5
+tube_B0          = 1.0
+tube_dt          = 0.01
+
+# Refinement: square box [-0.6, 0.6]^2.
+tube_refine_kind     = box
+tube_refine_box_lo_x = -0.6
+tube_refine_box_lo_y = -0.6
+tube_refine_box_hi_x =  0.6
+tube_refine_box_hi_y =  0.6
+
+# Alternative loose patch (kept for reference): disk r in [0, 0.70].
+# Same physical region but rounded edges — many more CF corners and
+# greater CF surface area than the box variant.
+#tube_refine_kind = disk
+#tube_refine_band = 0.2
+
+# Solver
+verbose        = 2
+bottom_verbose = 0
+max_iter       = 500
+tol_rel        = 1.0e-7
+
+plot_dir = output/curlcurl_amr/tube_loose
+
+amrex.fpe_trap_invalid = 0
+amrex.fpe_trap_zero    = 0
+amrex.fpe_trap_overflow= 0

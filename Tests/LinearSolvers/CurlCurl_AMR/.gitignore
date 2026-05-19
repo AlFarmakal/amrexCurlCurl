@@ -1,0 +1,16 @@
+# Build artifacts
+tmp_build_dir/
+*.ex
+*.o
+*.d
+*.a
+
+# Run output
+output/
+none/
+plt_*/
+movie.visit
+Backtrace.*
+
+# Editor/agent state
+.claude/
