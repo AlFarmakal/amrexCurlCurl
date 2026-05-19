@@ -12,5 +12,11 @@ plt_*/
 movie.visit
 Backtrace.*
 
+# Forward-port scratch dirs (transient test stdout)
+baseline/
+post5276/
+post5371/
+build.*.log
+
 # Editor/agent state
 .claude/
