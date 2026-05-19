@@ -1472,6 +1472,9 @@ void mlcurlcurl_adotx_y_alpha (int i, int j, int k, Array4<Real> const& Ax,
     Real const alpha_hi = afz(i  ,j,k);
     Real const alpha_lo = afz(i-1,j,k);
 
+    // The discrezation for curvilinear coordinates does not reduce to the
+    // same form used by the scalar alpha case. But I think either form is fine.
+
     if (coord == 0) {
         Real const curl_lo = dxinv0 * (ey(i  ,j,k) - ey(i-1,j,k));
         Real const curl_hi = dxinv0 * (ey(i+1,j,k) - ey(i  ,j,k));
@@ -1545,6 +1548,9 @@ void mlcurlcurl_adotx_z_alpha (int i, int j, int k, Array4<Real> const& Ax,
     Real const dxinv0 = dxinv[0];
     Real const alpha_hi = afy(i  ,j,k);
     Real const alpha_lo = afy(i-1,j,k);
+
+    // The discrezation for curvilinear coordinates does not reduce to the
+    // same form used by the scalar alpha case. But I think either form is fine.
 
     if (coord == 0) {
         Real const curl_lo = dxinv0 * (ez(i  ,j,k) - ez(i-1,j,k));
