@@ -6,6 +6,20 @@
 #include <AMReX_LUSolver.H>
 #include <AMReX_PCGSolver.H>
 
+// Level-by-level AMR convergence fix.
+// 0 = production behaviour (no β CF-ghost guard, no Galerkin diagonal
+//     correction at mglev>0). Reproduces the level-by-level divergence and,
+//     in DEBUG/FPE builds, the smooth4 NaN-β abort.
+// 1 = (a) zero β at CF-ghost edges before the per-node diagonal build to
+//         prevent NaN propagation, and
+//     (b) add +α/dx_nodal² to the diagonal of every valid edge whose
+//         nodal-direction neighbour is a CF-ghost edge, at MG coarse
+//         levels (mglev>0) only.
+// Toggle by editing this single line.
+#ifndef MLCC_CF_GALERKIN
+#define MLCC_CF_GALERKIN 1
+#endif
+
 namespace amrex {
 
 /* Index types
@@ -181,14 +195,10 @@ namespace amrex {
                      + ex(i  ,j+1,k  ))
 */
 
-/// \cond DOXYGEN_IGNORE
 struct CurlCurlDirichletInfo
 {
     IntVect dirichlet_lo;
     IntVect dirichlet_hi;
-#if (AMREX_SPACEDIM < 3)
-    int coord = 0;
-#endif
 
     [[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
     bool is_dirichlet_node (int i, int j, int k) const
@@ -239,11 +249,7 @@ struct CurlCurlDirichletInfo
     {
 #if (AMREX_SPACEDIM == 1)
         amrex::ignore_unused(j);
-        if ((i == 0) && (coord == 1)) {
-            return false; // Ez in 1d cyl is not dirichlet
-        } else {
-            return (i == dirichlet_lo[0]) || (i == dirichlet_hi[0]);
-        }
+        return (i == dirichlet_lo[0]) || (i == dirichlet_hi[0]);
 #else
         return (i == dirichlet_lo[0]) || (i == dirichlet_hi[0])
             || (j == dirichlet_lo[1]) || (j == dirichlet_hi[1]);
@@ -333,8 +339,6 @@ struct CurlCurlSymmetryInfo
 
 enum struct CurlCurlStateType { x, b, r }; // x, b & r=b-Ax
 
-/// \endcond
-
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
 void mlcurlcurl_adotx_x (int i, int j, int k, Array4<Real> const& Ax,
                          Array4<Real const> const& ex,
@@ -383,33 +387,16 @@ void mlcurlcurl_adotx_y (int i, int j, int k, Array4<Real> const& Ay,
                          Array4<Real const> const& ex,
                          Array4<Real const> const& ey,
                          Array4<Real const> const& ez,
-                         Real beta, GpuArray<Real,AMREX_SPACEDIM> const& adxinv
-#if (AMREX_SPACEDIM < 3)
-                         , int coord
-#endif
-                        )
+                         Real beta, GpuArray<Real,AMREX_SPACEDIM> const& adxinv)
 {
 #if (AMREX_SPACEDIM == 1)
     amrex::ignore_unused(ex,ez);
-    Real ccey;
-    if (coord == 0) {
-        ccey =  ey(i  ,j,k) * Real(2.0)
-            -   ey(i-1,j,k)
-            -   ey(i+1,j,k);
-    } else if (coord == 1) {
-        // i=0 won't get here
-        ccey =  ey(i  ,j,k) * (Real( 1.0)/(Real(i)*Real(i)) + Real(2.0))
-            +   ey(i-1,j,k) * (Real( 0.5)/Real(i) - Real(1.0))
-            +   ey(i+1,j,k) * (Real(-0.5)/Real(i) - Real(1.0));
-    } else {
-        // i=0 won't get here
-        ccey =  ey(i  ,j,k) * Real(2.0)
-            +   ey(i-1,j,k) * (Real( 1.0)/Real(i) - Real(1.0))
-            +   ey(i+1,j,k) * (Real(-1.0)/Real(i) - Real(1.0));
-    }
-    ccey *= adxinv[0] * adxinv[0];
+    Real dxx = adxinv[0] * adxinv[0];
+    Real ccey =  ey(i  ,j  ,k  ) * dxx * Real(2.0)
+        - dxx * (ey(i-1,j  ,k  ) +
+                 ey(i+1,j  ,k  ));
 #elif (AMREX_SPACEDIM == 2)
-    amrex::ignore_unused(ez,coord);
+    amrex::ignore_unused(ez);
     Real dxx = adxinv[0] * adxinv[0];
     Real dxy = adxinv[0] * adxinv[1];
     Real ccey =  ey(i  ,j  ,k  ) * dxx * Real(2.0)
@@ -446,35 +433,16 @@ void mlcurlcurl_adotx_z (int i, int j, int k, Array4<Real> const& Az,
                          Array4<Real const> const& ex,
                          Array4<Real const> const& ey,
                          Array4<Real const> const& ez,
-                         Real beta, GpuArray<Real,AMREX_SPACEDIM> const& adxinv
-#if (AMREX_SPACEDIM < 3)
-                         , int coord
-#endif
-                        )
+                         Real beta, GpuArray<Real,AMREX_SPACEDIM> const& adxinv)
 {
 #if (AMREX_SPACEDIM == 1)
     amrex::ignore_unused(ex,ey);
-    Real ccez;
-    if (coord == 0) {
-        ccez =  ez(i  ,j,k) * Real(2.0)
-            -   ez(i-1,j,k)
-            -   ez(i+1,j,k);
-    } else if (coord == 1) {
-        if (i == 0) {
-            ccez = Real(4.0) * (ez(0,0,0) - ez(1,0,0));
-        } else {
-            ccez =  ez(i  ,j,k) * Real(2.0)
-                +   ez(i-1,j,k) * (Real( 0.5)/Real(i) - Real(1.0))
-                +   ez(i+1,j,k) * (Real(-0.5)/Real(i) - Real(1.0));
-        }
-    } else {
-        ccez =  ez(i  ,j,k) * Real(2.0)
-            +   ez(i-1,j,k) * (Real( 1.0)/Real(i) - Real(1.0))
-            +   ez(i+1,j,k) * (Real(-1.0)/Real(i) - Real(1.0));
-    }
-    ccez *= adxinv[0] * adxinv[0];
+    Real dxx = adxinv[0] * adxinv[0];
+    Real ccez =  ez(i  ,j  ,k  ) * dxx*Real(2.0)
+        - dxx * (ez(i-1,j  ,k  ) +
+                 ez(i+1,j  ,k  ));
 #elif (AMREX_SPACEDIM == 2)
-    amrex::ignore_unused(ex,ey,coord);
+    amrex::ignore_unused(ex,ey);
     Real dxx = adxinv[0] * adxinv[0];
     Real dyy = adxinv[1] * adxinv[1];
     Real ccez =  ez(i  ,j  ,k  ) * (dxx+dyy)*Real(2.0)
@@ -504,226 +472,22 @@ void mlcurlcurl_adotx_z (int i, int j, int k, Array4<Real> const& Az,
     Az(i,j,k) = ccez + beta * ez(i,j,k);
 }
 
-AMREX_GPU_DEVICE AMREX_FORCE_INLINE
-void mlcurlcurl_adotx_x_alpha (int i, int j, int k, Array4<Real> const& Ax,
-                               Array4<Real const> const& ex,
-                               Array4<Real const> const& ey,
-                               Array4<Real const> const& ez,
-                               Array4<Real const> const& afy,
-                               Array4<Real const> const& afz,
-                               Real beta, GpuArray<Real,AMREX_SPACEDIM> const& dxinv)
-{
-#if (AMREX_SPACEDIM == 1)
-    amrex::ignore_unused(ey,ez,afy,afz,dxinv);
-    Ax(i,j,k) = beta * ex(i,j,k);
-#elif (AMREX_SPACEDIM == 2)
-    amrex::ignore_unused(ez,afy);
-
-    Real const alpha_hi = afz(i,j,k);
-    Real const alpha_lo = afz(i,j-1,k);
-
-    Real const curlz_hi = dxinv[0] * (ey(i+1,j  ,k) - ey(i  ,j  ,k))
-                        - dxinv[1] * (ex(i  ,j+1,k) - ex(i  ,j  ,k));
-    Real const curlz_lo = dxinv[0] * (ey(i+1,j-1,k) - ey(i  ,j-1,k))
-                        - dxinv[1] * (ex(i  ,j  ,k) - ex(i  ,j-1,k));
-
-    Real const ccex = dxinv[1] * (alpha_hi * curlz_hi - alpha_lo * curlz_lo);
-
-    Ax(i,j,k) = ccex + beta * ex(i,j,k);
-#else
-    Real const ay_lo = afy(i,j  ,k-1);
-    Real const ay_hi = afy(i,j  ,k  );
-    Real const az_lo = afz(i,j-1,k  );
-    Real const az_hi = afz(i,j  ,k  );
-
-    Real const curlz_hi = dxinv[0] * (ey(i+1,j  ,k  ) - ey(i  ,j  ,k  ))
-                        - dxinv[1] * (ex(i  ,j+1,k  ) - ex(i  ,j  ,k  ));
-    Real const curlz_lo = dxinv[0] * (ey(i+1,j-1,k  ) - ey(i  ,j-1,k  ))
-                        - dxinv[1] * (ex(i  ,j  ,k  ) - ex(i  ,j-1,k  ));
-
-    Real const curly_hi = dxinv[2] * (ex(i  ,j  ,k+1) - ex(i  ,j  ,k  ))
-                        - dxinv[0] * (ez(i+1,j  ,k  ) - ez(i  ,j  ,k  ));
-    Real const curly_lo = dxinv[2] * (ex(i  ,j  ,k  ) - ex(i  ,j  ,k-1))
-                        - dxinv[0] * (ez(i+1,j  ,k-1) - ez(i  ,j  ,k-1));
-
-    Real const ccex = dxinv[1] * (az_hi * curlz_hi - az_lo * curlz_lo)
-        -             dxinv[2] * (ay_hi * curly_hi - ay_lo * curly_lo);
-
-    Ax(i,j,k) = ccex + beta * ex(i,j,k);
-#endif
-}
-
-AMREX_GPU_DEVICE AMREX_FORCE_INLINE
-void mlcurlcurl_adotx_y_alpha (int i, int j, int k, Array4<Real> const& Ax,
-                               Array4<Real const> const& ex,
-                               Array4<Real const> const& ey,
-                               Array4<Real const> const& ez,
-                               Array4<Real const> const& afx,
-                               Array4<Real const> const& afz,
-                               Real beta, GpuArray<Real,AMREX_SPACEDIM> const& dxinv
-#if (AMREX_SPACEDIM < 3)
-                               , int coord
-#endif
-                               )
-{
-#if (AMREX_SPACEDIM == 1)
-    amrex::ignore_unused(ex,ez,afx);
-    Real const dxinv0 = dxinv[0];
-    Real const alpha_hi = afz(i  ,j,k);
-    Real const alpha_lo = afz(i-1,j,k);
-
-    // The discrezation for curvilinear coordinates does not reduce to the
-    // same form used by the scalar alpha case. But I think either form is fine.
-
-    if (coord == 0) {
-        Real const curl_lo = dxinv0 * (ey(i  ,j,k) - ey(i-1,j,k));
-        Real const curl_hi = dxinv0 * (ey(i+1,j,k) - ey(i  ,j,k));
-        Real const ccey = dxinv0 * (alpha_lo * curl_lo - alpha_hi * curl_hi);
-        Ax(i,j,k) = ccey + beta * ey(i,j,k);
-    } else if (coord == 1) {
-        Real const curl_lo = dxinv0 * (Real(i)*ey(i  ,j,k) - Real(i-1)*ey(i-1,j,k))
-            / (Real(i)-Real(0.5));
-        Real const curl_hi = dxinv0 * (Real(i+1)*ey(i+1,j,k) - Real(i)*ey(i  ,j,k))
-            / (Real(i)+Real(0.5));
-        Real const ccey = dxinv0 * (alpha_lo * curl_lo - alpha_hi * curl_hi);
-        Ax(i,j,k) = ccey + beta * ey(i,j,k);
-    } else {
-        Real const curl_lo = dxinv0 * (Real(i)*ey(i  ,j,k) - Real(i-1)*ey(i-1,j,k));
-        Real const curl_hi = dxinv0 * (Real(i+1)*ey(i+1,j,k) - Real(i)*ey(i  ,j,k));
-        Real const ccey = dxinv0 * (alpha_lo*curl_lo - alpha_hi*curl_hi) / Real(i);
-        Ax(i,j,k) = ccey + beta * ey(i,j,k);
-    }
-#elif (AMREX_SPACEDIM == 2)
-    amrex::ignore_unused(ez,afx,coord);
-
-    Real const alpha_rt = afz(i  ,j,k);
-    Real const alpha_lf = afz(i-1,j,k);
-
-    Real const curlz_rt = dxinv[0] * (ey(i+1,j  ,k) - ey(i  ,j  ,k))
-                        - dxinv[1] * (ex(i  ,j+1,k) - ex(i  ,j  ,k));
-    Real const curlz_lf = dxinv[0] * (ey(i  ,j  ,k) - ey(i-1,j  ,k))
-                        - dxinv[1] * (ex(i-1,j+1,k) - ex(i-1,j  ,k));
-
-    Real const ccey = dxinv[0] * (alpha_lf * curlz_lf - alpha_rt * curlz_rt);
-
-    Ax(i,j,k) = ccey + beta * ey(i,j,k);
-#else
-    Real const ax_lo = afx(i  ,j,k-1);
-    Real const ax_hi = afx(i  ,j,k  );
-    Real const az_lo = afz(i-1,j,k  );
-    Real const az_hi = afz(i  ,j,k  );
-
-    Real const curlz_hi = dxinv[0] * (ey(i+1,j  ,k  ) - ey(i  ,j  ,k  ))
-                        - dxinv[1] * (ex(i  ,j+1,k  ) - ex(i  ,j  ,k  ));
-    Real const curlz_lo = dxinv[0] * (ey(i  ,j  ,k  ) - ey(i-1,j  ,k  ))
-                        - dxinv[1] * (ex(i-1,j+1,k  ) - ex(i-1,j  ,k  ));
-
-    Real const curlx_hi = dxinv[1] * (ez(i  ,j+1,k  ) - ez(i  ,j  ,k  ))
-                        - dxinv[2] * (ey(i  ,j  ,k+1) - ey(i  ,j  ,k  ));
-    Real const curlx_lo = dxinv[1] * (ez(i  ,j+1,k-1) - ez(i  ,j  ,k-1))
-                        - dxinv[2] * (ey(i  ,j  ,k  ) - ey(i  ,j  ,k-1));
-
-    Real const ccey = dxinv[2] * (ax_hi * curlx_hi - ax_lo * curlx_lo)
-        -             dxinv[0] * (az_hi * curlz_hi - az_lo * curlz_lo);
-
-    Ax(i,j,k) = ccey + beta * ey(i,j,k);
-#endif
-}
-
-AMREX_GPU_DEVICE AMREX_FORCE_INLINE
-void mlcurlcurl_adotx_z_alpha (int i, int j, int k, Array4<Real> const& Ax,
-                               Array4<Real const> const& ex,
-                               Array4<Real const> const& ey,
-                               Array4<Real const> const& ez,
-                               Array4<Real const> const& afx,
-                               Array4<Real const> const& afy,
-                               Real beta, GpuArray<Real,AMREX_SPACEDIM> const& dxinv
-#if (AMREX_SPACEDIM < 3)
-                               , int coord
-#endif
-                               )
-{
-#if (AMREX_SPACEDIM == 1)
-    amrex::ignore_unused(ex,ey,afx);
-    Real const dxinv0 = dxinv[0];
-    Real const alpha_hi = afy(i  ,j,k);
-    Real const alpha_lo = afy(i-1,j,k);
-
-    // The discrezation for curvilinear coordinates does not reduce to the
-    // same form used by the scalar alpha case. But I think either form is fine.
-
-    if (coord == 0) {
-        Real const curl_lo = dxinv0 * (ez(i  ,j,k) - ez(i-1,j,k));
-        Real const curl_hi = dxinv0 * (ez(i+1,j,k) - ez(i  ,j,k));
-        Real const ccez = dxinv0 * (alpha_lo * curl_lo - alpha_hi * curl_hi);
-        Ax(i,j,k) = ccez + beta * ez(i,j,k);
-    } else if (coord == 1) {
-        Real ccez;
-        if (i == 0) {
-            ccez = Real(4.0) * (ez(0,0,0) - ez(1,0,0)) * alpha_hi * dxinv0*dxinv0;
-        } else {
-            Real const curl_lo = dxinv0 * (ez(i  ,j,k) - ez(i-1,j,k));
-            Real const curl_hi = dxinv0 * (ez(i+1,j,k) - ez(i  ,j,k));
-            ccez = dxinv0 * ((Real(i)-Real(0.5))*alpha_lo*curl_lo -
-                             (Real(i)+Real(0.5))*alpha_hi*curl_hi)/Real(i);
-        }
-        Ax(i,j,k) = ccez + beta * ez(i,j,k);
-    } else {
-        Real const curl_lo = dxinv0 * (Real(i)*ez(i  ,j,k) - Real(i-1)*ez(i-1,j,k));
-        Real const curl_hi = dxinv0 * (Real(i+1)*ez(i+1,j,k) - Real(i)*ez(i  ,j,k));
-        Real const ccez = dxinv0 * (alpha_lo*curl_lo - alpha_hi*curl_hi) / Real(i);
-        Ax(i,j,k) = ccez + beta * ez(i,j,k);
-    }
-#elif (AMREX_SPACEDIM == 2)
-    amrex::ignore_unused(ex,ey,coord);
-
-    Real const cx_up =  dxinv[1] * (ez(i  ,j+1,k) - ez(i  ,j  ,k));
-    Real const cx_dn =  dxinv[1] * (ez(i  ,j  ,k) - ez(i  ,j-1,k));
-    Real const cy_rt = -dxinv[0] * (ez(i+1,j  ,k) - ez(i  ,j  ,k));
-    Real const cy_lf = -dxinv[0] * (ez(i  ,j  ,k) - ez(i-1,j  ,k));
-
-    Real const ccez = dxinv[0] * (afy(i  ,j  ,k) * cy_rt - afy(i-1,j  ,k) * cy_lf)
-                    - dxinv[1] * (afx(i  ,j  ,k) * cx_up - afx(i  ,j-1,k) * cx_dn);
-
-    Ax(i,j,k) = ccez + beta * ez(i,j,k);
-#else
-    Real const ay_lo = afy(i-1,j  ,k);
-    Real const ay_hi = afy(i  ,j  ,k);
-    Real const ax_lo = afx(i  ,j-1,k);
-    Real const ax_hi = afx(i  ,j  ,k);
-
-    Real const curlx_hi = dxinv[1] * (ez(i  ,j+1,k  ) - ez(i  ,j  ,k  ))
-                        - dxinv[2] * (ey(i  ,j  ,k+1) - ey(i  ,j  ,k  ));
-    Real const curlx_lo = dxinv[1] * (ez(i  ,j  ,k  ) - ez(i  ,j-1,k  ))
-                        - dxinv[2] * (ey(i  ,j-1,k+1) - ey(i  ,j-1,k  ));
-
-    Real const curly_hi = dxinv[2] * (ex(i  ,j  ,k+1) - ex(i  ,j  ,k  ))
-                        - dxinv[0] * (ez(i+1,j  ,k  ) - ez(i  ,j  ,k  ));
-    Real const curly_lo = dxinv[2] * (ex(i-1,j  ,k+1) - ex(i-1,j  ,k  ))
-                        - dxinv[0] * (ez(i  ,j  ,k  ) - ez(i-1,j  ,k  ));
-
-    Real const ccez = dxinv[0] * (ay_hi * curly_hi - ay_lo * curly_lo)
-        -             dxinv[1] * (ax_hi * curlx_hi - ax_lo * curlx_lo);
-
-    Ax(i,j,k) = ccez + beta * ez(i,j,k);
-#endif
-}
-
 #if (AMREX_SPACEDIM == 1)
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
-void mlcurlcurl_smooth_1d (int i, int j, int k,
-                           Array4<Real> const& ex,
-                           Array4<Real> const& ey,
-                           Array4<Real> const& ez,
-                           Array4<Real const> const& rhsx,
-                           Array4<Real const> const& rhsy,
-                           Array4<Real const> const& rhsz,
-                           Real beta,
-                           GpuArray<Real,AMREX_SPACEDIM> const& adxinv,
-                           int color,
-                           CurlCurlDirichletInfo const& dinfo, bool valid_x,
-                           int coord)
+void mlcurlcurl_1D (int i, int j, int k,
+                    Array4<Real> const& ex,
+                    Array4<Real> const& ey,
+                    Array4<Real> const& ez,
+                    Array4<Real const> const& rhsx,
+                    Array4<Real const> const& rhsy,
+                    Array4<Real const> const& rhsz,
+                    Real beta,
+                    GpuArray<Real,AMREX_SPACEDIM> const& adxinv,
+                    int color,
+                    CurlCurlDirichletInfo const& dinfo, bool valid_x)
 {
+    if (dinfo.is_dirichlet_node(i,j,k)) {return; }
+
     Real dxx = adxinv[0] * adxinv[0];
 
     int my_color = i%2;
@@ -734,83 +498,37 @@ void mlcurlcurl_smooth_1d (int i, int j, int k,
             ex(i,j,k) = rhsx(i,j,k) / beta;
         }
 
-        if (coord == 0)
-        {
-            if (dinfo.is_dirichlet_node(i,j,k)) { return; }
+        Real gamma_y = dxx * Real(2.0) + beta;
+        Real ccey = - dxx * (ey(i-1,j  ,k  ) +
+                             ey(i+1,j  ,k  ) );
+        Real res_y = rhsy(i,j,k) - ( gamma_y * ey(i,j,k) + ccey );
+        ey(i,j,k) += res_y/gamma_y;
 
-            Real cm = -dxx;
-            Real cp = -dxx;
-
-            Real gamma = dxx * Real(2.0) + beta;
-
-            Real ccey = cm * ey(i-1,j,k) + cp * ey(i+1,j,k);
-            Real res_y = rhsy(i,j,k) - ( gamma * ey(i,j,k) + ccey );
-            ey(i,j,k) += res_y/gamma;
-
-            Real ccez = cm * ez(i-1,j,k) + cp * ez(i+1,j,k);
-            Real res_z = rhsz(i,j,k) - ( gamma * ez(i,j,k) + ccez );
-            ez(i,j,k) += res_z/gamma;
-        }
-        else if (coord == 1)
-        {
-            if ((i > 0) && ! dinfo.is_dirichlet_node(i,j,k)) {
-                Real cm = dxx * (Real( 0.5)/Real(i) - Real(1.0));
-                Real cp = dxx * (Real(-0.5)/Real(i) - Real(1.0));
-
-                Real gamma = dxx * (Real(1.0)/(Real(i)*Real(i)) + Real(2.0)) + beta;
-
-                Real ccey = cm * ey(i-1,j,k) + cp * ey(i+1,j,k);
-                Real res_y = rhsy(i,j,k) - ( gamma * ey(i,j,k) + ccey );
-                ey(i,j,k) += res_y/gamma;
-
-                gamma = dxx * Real(2.0) + beta;
-
-                Real ccez = cm * ez(i-1,j,k) + cp * ez(i+1,j,k);
-                Real res_z = rhsz(i,j,k) - ( gamma * ez(i,j,k) + ccez );
-                ez(i,j,k) += res_z/gamma;
-            }
-            if ((i == 0) || (i == 1)) {
-                ez(0,0,0) = (rhsz(0,0,0) + Real(4.0)*dxx*ez(1,0,0))
-                    / (beta + Real(4.0)*dxx);
-            }
-        }
-        else
-        {
-            if (i == 0 || dinfo.is_dirichlet_node(i,j,k)) { return; }
-
-            Real cm = dxx * (Real( 1.0)/Real(i) - Real(1.0));
-            Real cp = dxx * (Real(-1.0)/Real(i) - Real(1.0));
-
-            Real gamma = dxx * Real(2.0) + beta;
-
-            Real ccey = cm * ey(i-1,j,k) + cp * ey(i+1,j,k);
-            Real res_y = rhsy(i,j,k) - ( gamma * ey(i,j,k) + ccey );
-            ey(i,j,k) += res_y/gamma;
-
-            Real ccez = cm * ez(i-1,j,k) + cp * ez(i+1,j,k);
-            Real res_z = rhsz(i,j,k) - ( gamma * ez(i,j,k) + ccez );
-            ez(i,j,k) += res_z/gamma;
-        }
+        Real gamma_z = dxx * Real(2.0) + beta;
+        Real ccez = -dxx * (ez(i-1,j  ,k  ) +
+                            ez(i+1,j  ,k  ) );
+        Real res_z = rhsz(i,j,k) - ( gamma_z * ez(i,j,k) + ccez );
+        ez(i,j,k) += res_z/gamma_z;
     }
 }
 
 
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
-void mlcurlcurl_smooth_1d (int i, int j, int k,
-                           Array4<Real> const& ex,
-                           Array4<Real> const& ey,
-                           Array4<Real> const& ez,
-                           Array4<Real const> const& rhsx,
-                           Array4<Real const> const& rhsy,
-                           Array4<Real const> const& rhsz,
-                           Array4<Real const> const& betax,
-                           Array4<Real const> const& betay,
-                           Array4<Real const> const& betaz,
-                           GpuArray<Real,AMREX_SPACEDIM> const& adxinv,
-                           int color,
-                           CurlCurlDirichletInfo const& dinfo, bool valid_x,
-                           int coord)
+void mlcurlcurl_1D (int i, int j, int k,
+                    Array4<Real> const& ex,
+                    Array4<Real> const& ey,
+                    Array4<Real> const& ez,
+                    Array4<Real const> const& rhsx,
+                    Array4<Real const> const& rhsy,
+                    Array4<Real const> const& rhsz,
+                    Array4<Real const> const& betax,
+                    Array4<Real const> const& betay,
+                    Array4<Real const> const& betaz,
+                    GpuArray<Real,AMREX_SPACEDIM> const& adxinv,
+                    int color,
+                    CurlCurlDirichletInfo const& dinfo, bool valid_x)
 {
+    if (dinfo.is_dirichlet_node(i,j,k)) {return; }
     Real dxx = adxinv[0] * adxinv[0];
 
     int my_color = i%2;
@@ -821,282 +539,17 @@ void mlcurlcurl_smooth_1d (int i, int j, int k,
             ex(i,j,k) = rhsx(i,j,k) / betax(i,j,k);
         }
 
-        if (coord == 0)
-        {
-            if (dinfo.is_dirichlet_node(i,j,k)) { return; }
+        Real gamma_y = dxx * Real(2.0) + betay(i,j,k);
+        Real ccey = - dxx * (ey(i-1,j  ,k  ) +
+                             ey(i+1,j  ,k  ) );
+        Real res_y = rhsy(i,j,k) - ( gamma_y * ey(i,j,k) + ccey );
+        ey(i,j,k) += res_y/gamma_y;
 
-            Real cm = -dxx;
-            Real cp = -dxx;
-
-            Real gamma_y = dxx * Real(2.0) + betay(i,j,k);
-            Real ccey = cm * ey(i-1,j,k) + cp * ey(i+1,j,k);
-            Real res_y = rhsy(i,j,k) - ( gamma_y * ey(i,j,k) + ccey );
-            ey(i,j,k) += res_y/gamma_y;
-
-            Real gamma_z = dxx * Real(2.0) + betaz(i,j,k);
-            Real ccez = cm * ez(i-1,j,k) + cp * ez(i+1,j,k);
-            Real res_z = rhsz(i,j,k) - ( gamma_z * ez(i,j,k) + ccez );
-            ez(i,j,k) += res_z/gamma_z;
-        }
-        else if (coord == 1)
-        {
-            if ((i > 0) && ! dinfo.is_dirichlet_node(i,j,k)) {
-                Real cm = dxx * (Real( 0.5)/Real(i) - Real(1.0));
-                Real cp = dxx * (Real(-0.5)/Real(i) - Real(1.0));
-
-                Real gamma = dxx * (Real(1.0)/(Real(i)*Real(i)) + Real(2.0)) + betay(i,j,k);
-
-                Real ccey = cm * ey(i-1,j,k) + cp * ey(i+1,j,k);
-                Real res_y = rhsy(i,j,k) - ( gamma * ey(i,j,k) + ccey );
-                ey(i,j,k) += res_y/gamma;
-
-                gamma = dxx * Real(2.0) + betaz(i,j,k);
-
-                Real ccez = cm * ez(i-1,j,k) + cp * ez(i+1,j,k);
-                Real res_z = rhsz(i,j,k) - ( gamma * ez(i,j,k) + ccez );
-                ez(i,j,k) += res_z/gamma;
-            }
-            if ((i == 0) || (i == 1)) {
-                ez(0,0,0) = (rhsz(0,0,0) + Real(4.0)*dxx*ez(1,0,0)) / (betaz(0,0,0) + Real(4.0)*dxx);
-            }
-        }
-        else
-        {
-            if (dinfo.is_dirichlet_node(i,j,k)) { return; }
-
-            Real cm = dxx * (Real( 1.0)/Real(i) - Real(1.0));
-            Real cp = dxx * (Real(-1.0)/Real(i) - Real(1.0));
-
-            Real gamma_y = dxx * Real(2.0) + betay(i,j,k);
-            Real ccey = cm * ey(i-1,j,k) + cp * ey(i+1,j,k);
-            Real res_y = rhsy(i,j,k) - ( gamma_y * ey(i,j,k) + ccey );
-            ey(i,j,k) += res_y/gamma_y;
-
-            Real gamma_z = dxx * Real(2.0) + betaz(i,j,k);
-            Real ccez = cm * ez(i-1,j,k) + cp * ez(i+1,j,k);
-            Real res_z = rhsz(i,j,k) - ( gamma_z * ez(i,j,k) + ccez );
-            ez(i,j,k) += res_z/gamma_z;
-        }
-    }
-}
-
-AMREX_GPU_DEVICE AMREX_FORCE_INLINE
-void mlcurlcurl_smooth_1d_alpha_beta (int i, int j, int k,
-                                      Array4<Real> const& ex,
-                                      Array4<Real> const& ey,
-                                      Array4<Real> const& ez,
-                                      Array4<Real const> const& rhsx,
-                                      Array4<Real const> const& rhsy,
-                                      Array4<Real const> const& rhsz,
-                                      Array4<Real const> const& betax,
-                                      Array4<Real const> const& betay,
-                                      Array4<Real const> const& betaz,
-                                      GpuArray<Real,AMREX_SPACEDIM> const& adxinv,
-                                      int color,
-                                      CurlCurlDirichletInfo const& dinfo, bool valid_x,
-                                      int coord,
-                                      Array4<Real const> const& alphay,
-                                      Array4<Real const> const& alphaz)
-{
-    Real dxx = adxinv[0] * adxinv[0];
-
-    int my_color = i%2;
-    if (my_color != color) { return; }
-
-    if (valid_x) {
-        ex(i,j,k) = rhsx(i,j,k) / betax(i,j,k);
-    }
-
-    auto cartesian_update = [&] (Array4<Real> const& comp,
-                                 Array4<Real const> const& rhs,
-                                 Array4<Real const> const& beta,
-                                 Array4<Real const> const& alpha)
-    {
-        if (dinfo.is_dirichlet_node(i,j,k)) { return; }
-        Real alpha_lo = alpha(i-1,j,k);
-        Real alpha_hi = alpha(i  ,j,k);
-        Real cm = -dxx * alpha_lo;
-        Real cp = -dxx * alpha_hi;
-        Real gamma = dxx * (alpha_lo + alpha_hi) + beta(i,j,k);
-        Real cce = cm * comp(i-1,j,k) + cp * comp(i+1,j,k);
-        Real res = rhs(i,j,k) - (gamma * comp(i,j,k) + cce);
-        comp(i,j,k) += res / gamma;
-    };
-
-    auto cylindrical_y = [&] ()
-    {
-        if ((i > 0) && !dinfo.is_dirichlet_node(i,j,k)) {
-            Real ri = Real(i);
-            Real rimh = ri - Real(0.5);
-            Real riph = ri + Real(0.5);
-            Real alpha_lo = alphaz(i-1,j,k);
-            Real alpha_hi = alphaz(i  ,j,k);
-            Real cm = -dxx * alpha_lo * (ri-Real(1.0)) / rimh;
-            Real cp = -dxx * alpha_hi * (ri+Real(1.0)) / riph;
-            Real gamma = dxx * (alpha_lo * ri/rimh + alpha_hi * ri/riph)
-                + betay(i,j,k);
-            Real ccey = cm * ey(i-1,j,k) + cp * ey(i+1,j,k);
-            Real res_y = rhsy(i,j,k) - (gamma * ey(i,j,k) + ccey);
-            ey(i,j,k) += res_y / gamma;
-        }
-    };
-
-    auto cylindrical_z = [&] ()
-    {
-        if ((i > 0) && !dinfo.is_dirichlet_node(i,j,k)) {
-            Real ri = Real(i);
-            Real alpha_lo = alphay(i-1,j,k);
-            Real alpha_hi = alphay(i  ,j,k);
-            Real cm = -(dxx/ri) * (ri-Real(0.5)) * alpha_lo;
-            Real cp = -(dxx/ri) * (ri+Real(0.5)) * alpha_hi;
-            Real gamma = (dxx/ri) * ((ri-Real(0.5))*alpha_lo +
-                                     (ri+Real(0.5))*alpha_hi)
-                + betaz(i,j,k);
-            Real ccez = cm * ez(i-1,j,k) + cp * ez(i+1,j,k);
-            Real res_z = rhsz(i,j,k) - (gamma * ez(i,j,k) + ccez);
-            ez(i,j,k) += res_z / gamma;
-        }
-        if ((i == 0) || (i == 1)) {
-            Real alpha_axis = alphay(0,j,k);
-            Real gamma = betaz(0,j,k) + Real(4.0)*dxx*alpha_axis;
-            Real num = rhsz(0,j,k) + Real(4.0)*dxx*alpha_axis * ez(1,j,k);
-            ez(0,j,k) = num / gamma;
-        }
-    };
-
-    auto spherical_update = [&] (Array4<Real> const& comp,
-                                 Array4<Real const> const& rhs,
-                                 Array4<Real const> const& beta,
-                                 Array4<Real const> const& alpha)
-    {
-        if (i == 0 || dinfo.is_dirichlet_node(i,j,k)) { return; }
-        Real ri = Real(i);
-        Real alpha_lo = alpha(i-1,j,k);
-        Real alpha_hi = alpha(i  ,j,k);
-        Real cm = -dxx * alpha_lo * Real(i-1) / ri;
-        Real cp = -dxx * alpha_hi * Real(i+1) / ri;
-        Real gamma = dxx * (alpha_lo + alpha_hi) + beta(i,j,k);
-        Real cce = cm * comp(i-1,j,k) + cp * comp(i+1,j,k);
-        Real res = rhs(i,j,k) - (gamma * comp(i,j,k) + cce);
-        comp(i,j,k) += res / gamma;
-    };
-
-    if (coord == 0) {
-        cartesian_update(ey, rhsy, betay, alphaz);
-        cartesian_update(ez, rhsz, betaz, alphay);
-    } else if (coord == 1) {
-        cylindrical_y();
-        cylindrical_z();
-    } else {
-        spherical_update(ey, rhsy, betay, alphaz);
-        spherical_update(ez, rhsz, betaz, alphay);
-    }
-}
-
-AMREX_GPU_DEVICE AMREX_FORCE_INLINE
-void mlcurlcurl_smooth_1d_alpha (int i, int j, int k,
-                                 Array4<Real> const& ex,
-                                 Array4<Real> const& ey,
-                                 Array4<Real> const& ez,
-                                 Array4<Real const> const& rhsx,
-                                 Array4<Real const> const& rhsy,
-                                 Array4<Real const> const& rhsz,
-                                 Real beta,
-                                 GpuArray<Real,AMREX_SPACEDIM> const& adxinv,
-                                 int color,
-                                 CurlCurlDirichletInfo const& dinfo, bool valid_x,
-                                 int coord,
-                                 Array4<Real const> const& alphay,
-                                 Array4<Real const> const& alphaz)
-{
-    Real dxx = adxinv[0] * adxinv[0];
-
-    int my_color = i%2;
-    if (my_color != color) { return; }
-
-    if (valid_x) {
-        ex(i,j,k) = rhsx(i,j,k) / beta;
-    }
-
-    auto cartesian_update = [&] (Array4<Real> const& comp,
-                                 Array4<Real const> const& rhs,
-                                 Array4<Real const> const& alpha)
-    {
-        if (dinfo.is_dirichlet_node(i,j,k)) { return; }
-        Real alpha_lo = alpha(i-1,j,k);
-        Real alpha_hi = alpha(i  ,j,k);
-        Real cm = -dxx * alpha_lo;
-        Real cp = -dxx * alpha_hi;
-        Real gamma = dxx * (alpha_lo + alpha_hi) + beta;
-        Real cce = cm * comp(i-1,j,k) + cp * comp(i+1,j,k);
-        Real res = rhs(i,j,k) - (gamma * comp(i,j,k) + cce);
-        comp(i,j,k) += res / gamma;
-    };
-
-    auto cylindrical_y = [&] ()
-    {
-        if ((i > 0) && !dinfo.is_dirichlet_node(i,j,k)) {
-            Real ri = Real(i);
-            Real rimh = ri - Real(0.5);
-            Real riph = ri + Real(0.5);
-            Real alpha_lo = alphaz(i-1,j,k);
-            Real alpha_hi = alphaz(i  ,j,k);
-            Real cm = -dxx * alpha_lo * (ri-Real(1.0)) / rimh;
-            Real cp = -dxx * alpha_hi * (ri+Real(1.0)) / riph;
-            Real gamma = dxx * (alpha_lo * ri/rimh + alpha_hi * ri/riph) + beta;
-            Real ccey = cm * ey(i-1,j,k) + cp * ey(i+1,j,k);
-            Real res_y = rhsy(i,j,k) - (gamma * ey(i,j,k) + ccey);
-            ey(i,j,k) += res_y / gamma;
-        }
-    };
-
-    auto cylindrical_z = [&] ()
-    {
-        if ((i > 0) && !dinfo.is_dirichlet_node(i,j,k)) {
-            Real ri = Real(i);
-            Real alpha_lo = alphay(i-1,j,k);
-            Real alpha_hi = alphay(i  ,j,k);
-            Real cm = -(dxx/ri) * (ri-Real(0.5)) * alpha_lo;
-            Real cp = -(dxx/ri) * (ri+Real(0.5)) * alpha_hi;
-            Real gamma = (dxx/ri) * ((ri-Real(0.5))*alpha_lo +
-                                     (ri+Real(0.5))*alpha_hi) + beta;
-            Real ccez = cm * ez(i-1,j,k) + cp * ez(i+1,j,k);
-            Real res_z = rhsz(i,j,k) - (gamma * ez(i,j,k) + ccez);
-            ez(i,j,k) += res_z / gamma;
-        }
-        if ((i == 0) || (i == 1)) {
-            Real alpha_axis = alphay(0,j,k);
-            Real gamma = beta + Real(4.0)*dxx*alpha_axis;
-            Real num = rhsz(0,j,k) + Real(4.0)*dxx*alpha_axis * ez(1,j,k);
-            ez(0,j,k) = num / gamma;
-        }
-    };
-
-    auto spherical_update = [&] (Array4<Real> const& comp,
-                                 Array4<Real const> const& rhs,
-                                 Array4<Real const> const& alpha)
-    {
-        if (i == 0 || dinfo.is_dirichlet_node(i,j,k)) { return; }
-        Real ri = Real(i);
-        Real alpha_lo = alpha(i-1,j,k);
-        Real alpha_hi = alpha(i  ,j,k);
-        Real cm = -dxx * alpha_lo * Real(i-1) / ri;
-        Real cp = -dxx * alpha_hi * Real(i+1) / ri;
-        Real gamma = dxx * (alpha_lo + alpha_hi) + beta;
-        Real cce = cm * comp(i-1,j,k) + cp * comp(i+1,j,k);
-        Real res = rhs(i,j,k) - (gamma * comp(i,j,k) + cce);
-        comp(i,j,k) += res / gamma;
-    };
-
-    if (coord == 0) {
-        cartesian_update(ey, rhsy, alphaz);
-        cartesian_update(ez, rhsz, alphay);
-    } else if (coord == 1) {
-        cylindrical_y();
-        cylindrical_z();
-    } else {
-        spherical_update(ey, rhsy, alphaz);
-        spherical_update(ez, rhsz, alphay);
+        Real gamma_z = dxx * Real(2.0) + betaz(i,j,k);
+        Real ccez = -dxx * (ez(i-1,j  ,k  ) +
+                            ez(i+1,j  ,k  ) );
+        Real res_z = rhsz(i,j,k) - ( gamma_z * ez(i,j,k) + ccez );
+        ez(i,j,k) += res_z/gamma_z;
     }
 }
 
@@ -1150,7 +603,7 @@ void mlcurlcurl_gs4_lu (int i, int j, int k,
 
     Real dxy = adxinv[0]*adxinv[1];
 
-    GpuArray<Real,4> b
+    GpuArray<Real,6> b
         {rhsx(i-1,j,k) - (-dyy * ( ex(i-1,j-1,k  ) +
                                    ex(i-1,j+1,k  ))
                          + dxy * ( ey(i-1,j-1,k  )
@@ -1277,7 +730,16 @@ void mlcurlcurl_gs4_lu (int i, int j, int k,
 #endif
 }
 
-template <bool PCG>
+// Template parameter HasCF enables CF-ghost-aware handling of the
+// 4-block (2D) / 6-block (3D) LU solve. When HasCF is true, the caller
+// passes Array4<int const> CF masks (cfmx, cfmy[, cfmz]) where a
+// non-zero entry marks the corresponding edge as a CF-ghost edge — i.e.,
+// a ghost cell that lies across the AMR coarse-fine boundary. The kernel
+// enforces v[k]=0 for any CF-ghost unknown by zeroing its row and column
+// in the local LU matrix and setting b[k]=0. This keeps the smoother
+// consistent with the homogeneous CF boundary that applyBC imposes on
+// the correction equation between sweeps.
+template <bool PCG, bool HasCF=false>
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
 void mlcurlcurl_gs4 (int i, int j, int k,
                      Array4<Real> const& ex,
@@ -1292,8 +754,13 @@ void mlcurlcurl_gs4 (int i, int j, int k,
                      Array4<Real const> const& betay,
                      Array4<Real const> const& betaz,
                      CurlCurlDirichletInfo const& dinfo,
-                     CurlCurlSymmetryInfo const& sinfo)
+                     CurlCurlSymmetryInfo const& sinfo,
+                     Array4<int const> const& cfmx = Array4<int const>{},
+                     Array4<int const> const& cfmy = Array4<int const>{},
+                     Array4<int const> const& cfmz = Array4<int const>{},
+                     bool mg_coarse = false)
 {
+    amrex::ignore_unused(cfmx, cfmy, cfmz, mg_coarse);
     if (dinfo.is_dirichlet_node(i,j,k)) { return; }
 
     int my_color = i%2 + 2*(j%2);
@@ -1323,7 +790,7 @@ void mlcurlcurl_gs4 (int i, int j, int k,
 
     Real dxy = adxinv[0]*adxinv[1];
 
-    GpuArray<Real,4> b
+    GpuArray<Real,6> b
         {rhsx(i-1,j,k) - (-dyy * ( ex(i-1,j-1,k  ) +
                                    ex(i-1,j+1,k  ))
                          + dxy * ( ey(i-1,j-1,k  )
@@ -1365,11 +832,110 @@ void mlcurlcurl_gs4 (int i, int j, int k,
         beta[3] = betay(i,j  ,k);
     }
 
+    // Build the 4x4 stencil matrix. The default entries:
+    //   row 0 (ex(i-1,j)): (dyy*2+beta[0]) on diag, -dxy*v[2] + dxy*v[3]
+    //   row 1 (ex(i  ,j)): (dyy*2+beta[1]) on diag,  dxy*v[2] - dxy*v[3]
+    //   row 2 (ey(i,j-1)): -dxy*v[0] + dxy*v[1] + (dxx*2+beta[2]) on diag
+    //   row 3 (ey(i,j  )):  dxy*v[0] - dxy*v[1] + (dxx*2+beta[3]) on diag
+    // Off-diagonals m01,m10,m23,m32 are zero by construction.
+#if MLCC_CF_GALERKIN
+    // β is uninitialised (NaN in DEBUG) at CF-ghost edge positions. Zero
+    // before use — the HasCF block below overrides m_ii=1 for these rows,
+    // so this is functionally neutral and only prevents NaN propagation
+    // into the LU (and the DEBUG/FPE abort in smooth4).
+    if constexpr (HasCF) {
+        if (cfmx(i-1,j,k) != 0) { beta[0] = Real(0.0); }
+        if (cfmx(i  ,j,k) != 0) { beta[1] = Real(0.0); }
+        if (cfmy(i,j-1,k) != 0) { beta[2] = Real(0.0); }
+        if (cfmy(i,j  ,k) != 0) { beta[3] = Real(0.0); }
+    }
+#endif
+    Real m00 = dyy*Real(2.0) + beta[0];
+    Real m11 = dyy*Real(2.0) + beta[1];
+    Real m22 = dxx*Real(2.0) + beta[2];
+    Real m33 = dxx*Real(2.0) + beta[3];
+    Real m02 = -dxy, m03 =  dxy;
+    Real m12 =  dxy, m13 = -dxy;
+    Real m20 = -dxy, m21 =  dxy;
+    Real m30 =  dxy, m31 = -dxy;
+
+    // CF-ghost enforcement (Bug-#1 fix). At a CF-boundary node the 4-block
+    // includes one or more CF-ghost edge unknowns. The smoother MUST NOT
+    // solve for them — applyBC(homog) will reset them to 0 between
+    // sweeps, leaving the other unknowns inconsistent. Instead, force
+    // v[k]=0 here by Dirichlet row/column zero-out, so the LU finds the
+    // remaining unknowns consistent with v[k]=0.
+    if constexpr (HasCF) {
+        // ex unknowns are at cell-centred-x edges. cfmx is the cfmask
+        // for x-edges; non-zero ⇒ CF-ghost x-edge.
+        bool const is_cf_ex0 = (cfmx(i-1, j, k) != 0); // ex(i-1,j)
+        bool const is_cf_ex1 = (cfmx(i  , j, k) != 0); // ex(i  ,j)
+        bool const is_cf_ey0 = (cfmy(i, j-1, k) != 0); // ey(i,j-1)
+        bool const is_cf_ey1 = (cfmy(i, j  , k) != 0); // ey(i,j  )
+
+#if MLCC_CF_GALERKIN
+        // Galerkin diagonal correction at MG coarse levels (mglev>0).
+        // applyBC(homog) zeroes CF ghosts between sweeps, so the stencil
+        // coupling through a CF-ghost neighbour is effectively a Dirichlet
+        // term. For the rediscretised coarser-MG operator to match the
+        // Galerkin R·A_fine·P, the diagonal of the *valid* edge on the
+        // other side of the missing off-diagonal needs +α/dx_nodal².
+        // Without this, the V-cycle diverges in level-by-level solves on
+        // AMR grids (composite-loose is propped up by reflux/averageDown
+        // and converges even without this correction).
+        // Ex edges are nodal in y: only (j±1) neighbours count.
+        // Ey edges are nodal in x: only (i±1) neighbours count.
+        if (mg_coarse) {
+            if (!is_cf_ex0) {
+                if (cfmx(i-1, j+1, k) != 0) { m00 += dyy; }
+                if (cfmx(i-1, j-1, k) != 0) { m00 += dyy; }
+            }
+            if (!is_cf_ex1) {
+                if (cfmx(i  , j+1, k) != 0) { m11 += dyy; }
+                if (cfmx(i  , j-1, k) != 0) { m11 += dyy; }
+            }
+            if (!is_cf_ey0) {
+                if (cfmy(i+1, j-1, k) != 0) { m22 += dxx; }
+                if (cfmy(i-1, j-1, k) != 0) { m22 += dxx; }
+            }
+            if (!is_cf_ey1) {
+                if (cfmy(i+1, j  , k) != 0) { m33 += dxx; }
+                if (cfmy(i-1, j  , k) != 0) { m33 += dxx; }
+            }
+        }
+#endif
+
+        if (is_cf_ex0) {
+            m00 = Real(1.0);
+            m02 = Real(0.0); m03 = Real(0.0);
+            m20 = Real(0.0); m30 = Real(0.0);
+            b[0] = Real(0.0);
+        }
+        if (is_cf_ex1) {
+            m11 = Real(1.0);
+            m12 = Real(0.0); m13 = Real(0.0);
+            m21 = Real(0.0); m31 = Real(0.0);
+            b[1] = Real(0.0);
+        }
+        if (is_cf_ey0) {
+            m22 = Real(1.0);
+            m02 = Real(0.0); m12 = Real(0.0);
+            m20 = Real(0.0); m21 = Real(0.0);
+            b[2] = Real(0.0);
+        }
+        if (is_cf_ey1) {
+            m33 = Real(1.0);
+            m03 = Real(0.0); m13 = Real(0.0);
+            m30 = Real(0.0); m31 = Real(0.0);
+            b[3] = Real(0.0);
+        }
+    }
+
     if constexpr (PCG) {
-        Real diagInv[4] = {Real(1.0) / (dyy*Real(2.0) + beta[0]),
-                           Real(1.0) / (dyy*Real(2.0) + beta[1]),
-                           Real(1.0) / (dxx*Real(2.0) + beta[2]),
-                           Real(1.0) / (dxx*Real(2.0) + beta[3])};
+        Real diagInv[4] = {Real(1.0) / m00,
+                           Real(1.0) / m11,
+                           Real(1.0) / m22,
+                           Real(1.0) / m33};
         auto precond = [&] (Real * AMREX_RESTRICT z,
                             Real const* AMREX_RESTRICT r)
         {
@@ -1378,10 +944,10 @@ void mlcurlcurl_gs4 (int i, int j, int k,
         auto mat = [&] (Real * AMREX_RESTRICT Av,
                         Real const* AMREX_RESTRICT v)
         {
-            Av[0] = (dyy*Real(2.0) + beta[0]) * v[0] - dxy * v[2] + dxy * v[3];
-            Av[1] = (dyy*Real(2.0) + beta[1]) * v[1] + dxy * v[2] - dxy * v[3];
-            Av[2] = -dxy * v[0] + dxy * v[1] + (dxx*Real(2.0) + beta[2]) * v[2];
-            Av[3] =  dxy * v[0] - dxy * v[1] + (dxx*Real(2.0) + beta[3]) * v[3];
+            Av[0] = m00 * v[0] + m02 * v[2] + m03 * v[3];
+            Av[1] = m11 * v[1] + m12 * v[2] + m13 * v[3];
+            Av[2] = m20 * v[0] + m21 * v[1] + m22 * v[2];
+            Av[3] = m30 * v[0] + m31 * v[1] + m33 * v[3];
         };
         Real sol[4] = {0, 0, 0, 0};
         pcg_solve<4>(sol, b.data(), mat, precond, 8, Real(1.e-8));
@@ -1391,25 +957,10 @@ void mlcurlcurl_gs4 (int i, int j, int k,
         ey(i  ,j  ,k  ) = sol[3];
     } else {
         LUSolver<4,Real> lusolver
-            ({dyy*Real(2.0) + beta[0],
-              Real(0.0),
-             -dxy,
-              dxy,
-              //
-              Real(0.0),
-              dyy*Real(2.0) + beta[1],
-              dxy,
-             -dxy,
-              //
-             -dxy,
-              dxy,
-              dxx*Real(2.0) + beta[2],
-              Real(0.0),
-              //
-              dxy,
-             -dxy,
-              Real(0.0),
-              dxx*Real(2.0) + beta[3]});
+            ({m00,       Real(0.0), m02,       m03,
+              Real(0.0), m11,       m12,       m13,
+              m20,       m21,       m22,       Real(0.0),
+              m30,       m31,       Real(0.0), m33});
         lusolver(beta.data(), b.data());
         ex(i-1,j  ,k  ) = beta[0];
         ex(i  ,j  ,k  ) = beta[1];
@@ -1603,321 +1154,6 @@ void mlcurlcurl_gs4 (int i, int j, int k,
 #endif
 }
 
-AMREX_GPU_DEVICE AMREX_FORCE_INLINE
-void mlcurlcurl_gs4_alpha (int i, int j, int k,
-                           Array4<Real> const& ex,
-                           Array4<Real> const& ey,
-                           Array4<Real> const& ez,
-                           Array4<Real const> const& rhsx,
-                           Array4<Real const> const& rhsy,
-                           Array4<Real const> const& rhsz,
-                           GpuArray<Real,AMREX_SPACEDIM> const& dxinv,
-                           int color,
-                           Array4<Real const> const& alphax,
-                           Array4<Real const> const& alphay,
-                           Array4<Real const> const& alphaz,
-                           Array4<Real const> const& betax,
-                           Array4<Real const> const& betay,
-                           Array4<Real const> const& betaz, Real bscalar,
-                           CurlCurlDirichletInfo const& dinfo,
-                           CurlCurlSymmetryInfo const& sinfo)
-{
-    if (dinfo.is_dirichlet_node(i,j,k)) { return; }
-
-    int my_color = i%2 + 2*(j%2);
-    if (k%2 != 0) {
-        my_color = 3 - my_color;
-    }
-
-#if (AMREX_SPACEDIM == 2)
-
-    Real dxx = dxinv[0] * dxinv[0];
-    Real dyy = dxinv[1] * dxinv[1];
-
-    if (((my_color == 0 || my_color == 3) && (color == 0 || color == 3)) ||
-        ((my_color == 1 || my_color == 2) && (color == 1 || color == 2)))
-    {
-        Real beta = betaz ? betaz(i,j,k) : bscalar;
-        Real gamma = dxx*(alphay(i-1,j  ,k)+alphay(i,j,k))
-            +        dyy*(alphax(i  ,j-1,k)+alphax(i,j,k)) + beta;
-        Real ccez = - dxx * (ez(i-1,j  ,k  ) * alphay(i-1,j  ,k) +
-                             ez(i+1,j  ,k  ) * alphay(i  ,j  ,k))
-                    - dyy * (ez(i  ,j-1,k  ) * alphax(i  ,j-1,k) +
-                             ez(i  ,j+1,k  ) * alphax(i  ,j  ,k));
-        Real res = rhsz(i,j,k) - (gamma*ez(i,j,k) + ccez);
-        constexpr Real omega = Real(1.15);
-        ez(i,j,k) += omega/gamma * res;
-    }
-
-    if (my_color != color) { return; }
-
-    Real dxy = dxinv[0]*dxinv[1];
-
-    Real amm = alphaz(i-1,j-1,k);
-    Real am0 = alphaz(i-1,j  ,k);
-    Real a0m = alphaz(i  ,j-1,k);
-    Real a00 = alphaz(i  ,j  ,k);
-
-    GpuArray<Real,4> b
-        {rhsx(i-1,j,k) - (-dyy * ( ex(i-1,j-1,k  ) * amm +
-                                   ex(i-1,j+1,k  ) * am0 )
-                         + dxy * ( ey(i-1,j-1,k  ) * amm
-                                  -ey(i-1,j  ,k  ) * am0 )),
-         rhsx(i  ,j,k) - (-dyy * ( ex(i  ,j-1,k  ) * a0m +
-                                   ex(i  ,j+1,k  ) * a00 )
-                         + dxy * (-ey(i+1,j-1,k  ) * a0m
-                                  +ey(i+1,j  ,k  ) * a00 )),
-         rhsy(i,j-1,k) - (-dxx * ( ey(i-1,j-1,k  ) * amm +
-                                   ey(i+1,j-1,k  ) * a0m )
-                         + dxy * ( ex(i-1,j-1,k  ) * amm
-                                  -ex(i  ,j-1,k  ) * a0m )),
-         rhsy(i,j  ,k) - (-dxx * ( ey(i-1,j  ,k  ) * am0 +
-                                   ey(i+1,j  ,k  ) * a00 )
-                         + dxy * (-ex(i-1,j+1,k  ) * am0
-                                  +ex(i  ,j+1,k  ) * a00))};
-
-    GpuArray<Real,4> beta;
-
-    Real bxm = bscalar;
-    Real bx0 = bscalar;
-    if (betax) {
-        bxm = betax(i-1,j,k);
-        bx0 = betax(i  ,j,k);
-    }
-    Real bym = bscalar;
-    Real by0 = bscalar;
-    if (betay) {
-        bym = betay(i,j-1,k);
-        by0 = betay(i,j  ,k);
-    }
-
-    if (sinfo.xlo_is_symmetric(i)) {
-        b[0] = -b[1];
-        beta[0] = beta[1] = bx0;
-    } else if (sinfo.xhi_is_symmetric(i)) {
-        b[1] = -b[0];
-        beta[0] = beta[1] = bxm;
-    } else {
-        beta[0] = bxm;
-        beta[1] = bx0;
-    }
-
-    if (sinfo.ylo_is_symmetric(j)) {
-        b[2] = -b[3];
-        beta[2] = beta[3] = by0;
-    } else if (sinfo.yhi_is_symmetric(j)) {
-        b[3] = -b[2];
-        beta[2] = beta[3] = bym;
-    } else {
-        beta[2] = bym;
-        beta[3] = by0;
-    }
-
-    Real diagInv[4] = {Real(1.0) / (dyy*(amm+am0) + beta[0]),
-                       Real(1.0) / (dyy*(a0m+a00) + beta[1]),
-                       Real(1.0) / (dxx*(amm+a0m) + beta[2]),
-                       Real(1.0) / (dxx*(am0+a00) + beta[3])};
-    auto precond = [&] (Real * AMREX_RESTRICT z,
-                        Real const* AMREX_RESTRICT r)
-    {
-        for (int m = 0; m < 4; ++m) { z[m] = r[m] * diagInv[m]; }
-    };
-    auto mat = [&] (Real * AMREX_RESTRICT Av,
-                    Real const* AMREX_RESTRICT v)
-    {
-        Av[0] = (dyy*(am0+amm) + beta[0]) * v[0] - dxy*amm * v[2] + dxy*am0 * v[3];
-        Av[1] = (dyy*(a00+a0m) + beta[1]) * v[1] + dxy*a0m * v[2] - dxy*a00 * v[3];
-        Av[2] = -dxy*amm * v[0] + dxy*a0m * v[1] + (dxx*(amm+a0m) + beta[2]) * v[2];
-        Av[3] =  dxy*am0 * v[0] - dxy*a00 * v[1] + (dxx*(am0+a00) + beta[3]) * v[3];
-    };
-    Real sol[4] = {0, 0, 0, 0};
-    pcg_solve<4>(sol, b.data(), mat, precond, 8, Real(1.e-8));
-    ex(i-1,j  ,k  ) = sol[0];
-    ex(i  ,j  ,k  ) = sol[1];
-    ey(i  ,j-1,k  ) = sol[2];
-    ey(i  ,j  ,k  ) = sol[3];
-
-#elif (AMREX_SPACEDIM == 3)
-
-    if (my_color != color) { return; }
-
-    Real dxx = dxinv[0]*dxinv[0];
-    Real dyy = dxinv[1]*dxinv[1];
-    Real dzz = dxinv[2]*dxinv[2];
-    Real dxy = dxinv[0]*dxinv[1];
-    Real dxz = dxinv[0]*dxinv[2];
-    Real dyz = dxinv[1]*dxinv[2];
-
-    Real const az_mm = alphaz(i-1,j-1,k);
-    Real const az_m0 = alphaz(i-1,j  ,k);
-    Real const az_0m = alphaz(i  ,j-1,k);
-    Real const az_00 = alphaz(i  ,j  ,k);
-
-    Real const ay_mm = alphay(i-1,j  ,k-1);
-    Real const ay_m0 = alphay(i-1,j  ,k  );
-    Real const ay_0m = alphay(i  ,j  ,k-1);
-    Real const ay_00 = alphay(i  ,j  ,k  );
-
-    Real const ax_mm = alphax(i  ,j-1,k-1);
-    Real const ax_m0 = alphax(i  ,j-1,k  );
-    Real const ax_0m = alphax(i  ,j  ,k-1);
-    Real const ax_00 = alphax(i  ,j  ,k  );
-
-    GpuArray<Real,6> b
-        {rhsx(i-1,j,k) - (-dyy * ( ex(i-1,j-1,k  ) * az_mm +
-                                   ex(i-1,j+1,k  ) * az_m0)
-                         - dzz * ( ex(i-1,j  ,k-1) * ay_mm +
-                                   ex(i-1,j  ,k+1) * ay_m0)
-                         + dxy * ( ey(i-1,j-1,k  ) * az_mm
-                                  -ey(i-1,j  ,k  ) * az_m0)
-                         + dxz * ( ez(i-1,j  ,k-1) * ay_mm
-                                  -ez(i-1,j  ,k  ) * ay_m0)),
-         rhsx(i  ,j,k) - (-dyy * ( ex(i  ,j-1,k  ) * az_0m +
-                                   ex(i  ,j+1,k  ) * az_00)
-                         - dzz * ( ex(i  ,j  ,k-1) * ay_0m +
-                                   ex(i  ,j  ,k+1) * ay_00)
-                         + dxy * (-ey(i+1,j-1,k  ) * az_0m
-                                  +ey(i+1,j  ,k  ) * az_00)
-                         + dxz * (-ez(i+1,j  ,k-1) * ay_0m
-                                  +ez(i+1,j  ,k  ) * ay_00)),
-         rhsy(i,j-1,k) - (-dxx * ( ey(i-1,j-1,k  ) * az_mm +
-                                   ey(i+1,j-1,k  ) * az_0m)
-                         - dzz * ( ey(i  ,j-1,k-1) * ax_mm +
-                                   ey(i  ,j-1,k+1) * ax_m0)
-                         + dxy * ( ex(i-1,j-1,k  ) * az_mm
-                                  -ex(i  ,j-1,k  ) * az_0m)
-                         + dyz * ( ez(i  ,j-1,k-1) * ax_mm
-                                  -ez(i  ,j-1,k  ) * ax_m0)),
-         rhsy(i,j  ,k) - (-dxx * ( ey(i-1,j  ,k  ) * az_m0 +
-                                   ey(i+1,j  ,k  ) * az_00)
-                         - dzz * ( ey(i  ,j  ,k-1) * ax_0m +
-                                   ey(i  ,j  ,k+1) * ax_00)
-                         + dxy * (-ex(i-1,j+1,k  ) * az_m0
-                                  +ex(i  ,j+1,k  ) * az_00)
-                         + dyz * (-ez(i  ,j+1,k-1) * ax_0m
-                                  +ez(i  ,j+1,k  ) * ax_00)),
-         rhsz(i,j,k-1) - (-dxx * ( ez(i-1,j  ,k-1) * ay_mm +
-                                   ez(i+1,j  ,k-1) * ay_0m)
-                         - dyy * ( ez(i  ,j-1,k-1) * ax_mm +
-                                   ez(i  ,j+1,k-1) * ax_0m)
-                         + dxz * ( ex(i-1,j  ,k-1) * ay_mm
-                                  -ex(i  ,j  ,k-1) * ay_0m)
-                         + dyz * ( ey(i  ,j-1,k-1) * ax_mm
-                                  -ey(i  ,j  ,k-1) * ax_0m)),
-         rhsz(i,j,k  ) - (-dxx * ( ez(i-1,j  ,k  ) * ay_m0 +
-                                   ez(i+1,j  ,k  ) * ay_00)
-                         - dyy * ( ez(i  ,j-1,k  ) * ax_m0 +
-                                   ez(i  ,j+1,k  ) * ax_00)
-                         + dxz * (-ex(i-1,j  ,k+1) * ay_m0
-                                  +ex(i  ,j  ,k+1) * ay_00)
-                         + dyz * (-ey(i  ,j-1,k+1) * ax_m0
-                                  +ey(i  ,j  ,k+1) * ax_00))};
-
-    auto get_bx = [&] (int ii, int jj, int kk) -> Real
-    {
-        return betax ? betax(ii,jj,kk) : bscalar;
-    };
-    auto get_by = [&] (int ii, int jj, int kk) -> Real
-    {
-        return betay ? betay(ii,jj,kk) : bscalar;
-    };
-    auto get_bz = [&] (int ii, int jj, int kk) -> Real
-    {
-        return betaz ? betaz(ii,jj,kk) : bscalar;
-    };
-
-    GpuArray<Real,6> beta;
-
-    if (sinfo.xlo_is_symmetric(i)) {
-        b[0] = -b[1];
-        Real bx = get_bx(i,j,k);
-        beta[0] = beta[1] = bx;
-    } else if (sinfo.xhi_is_symmetric(i)) {
-        b[1] = -b[0];
-        Real bx = get_bx(i-1,j,k);
-        beta[0] = beta[1] = bx;
-    } else {
-        beta[0] = get_bx(i-1,j,k);
-        beta[1] = get_bx(i  ,j,k);
-    }
-
-    if (sinfo.ylo_is_symmetric(j)) {
-        b[2] = -b[3];
-        Real by = get_by(i,j,k);
-        beta[2] = beta[3] = by;
-    } else if (sinfo.yhi_is_symmetric(j)) {
-        b[3] = -b[2];
-        Real by = get_by(i,j-1,k);
-        beta[2] = beta[3] = by;
-    } else {
-        beta[2] = get_by(i,j-1,k);
-        beta[3] = get_by(i,j  ,k);
-    }
-
-    if (sinfo.zlo_is_symmetric(k)) {
-        b[4] = -b[5];
-        Real bz = get_bz(i,j,k);
-        beta[4] = beta[5] = bz;
-    } else if (sinfo.zhi_is_symmetric(k)) {
-        b[5] = -b[4];
-        Real bz = get_bz(i,j,k-1);
-        beta[4] = beta[5] = bz;
-    } else {
-        beta[4] = get_bz(i,j,k-1);
-        beta[5] = get_bz(i,j,k  );
-    }
-
-    Real diag0 = dyy*(az_mm+az_m0) + dzz*(ay_mm+ay_m0) + beta[0];
-    Real diag1 = dyy*(az_0m+az_00) + dzz*(ay_0m+ay_00) + beta[1];
-    Real diag2 = dxx*(az_mm+az_0m) + dzz*(ax_mm+ax_m0) + beta[2];
-    Real diag3 = dxx*(az_m0+az_00) + dzz*(ax_0m+ax_00) + beta[3];
-    Real diag4 = dxx*(ay_mm+ay_0m) + dyy*(ax_mm+ax_0m) + beta[4];
-    Real diag5 = dxx*(ay_m0+ay_00) + dyy*(ax_m0+ax_00) + beta[5];
-
-    Real diagInv[6] = {Real(1.0) / diag0,
-                       Real(1.0) / diag1,
-                       Real(1.0) / diag2,
-                       Real(1.0) / diag3,
-                       Real(1.0) / diag4,
-                       Real(1.0) / diag5};
-    auto precond = [&] (Real * AMREX_RESTRICT z,
-                        Real const* AMREX_RESTRICT r)
-    {
-        for (int m = 0; m < 6; ++m) { z[m] = r[m] * diagInv[m]; }
-    };
-    auto mat = [&] (Real * AMREX_RESTRICT Av,
-                    Real const* AMREX_RESTRICT v)
-    {
-        Av[0] = diag0 * v[0]
-            - dxy * az_mm * v[2] + dxy * az_m0 * v[3]
-            - dxz * ay_mm * v[4] + dxz * ay_m0 * v[5];
-        Av[1] = diag1 * v[1]
-            + dxy * az_0m * v[2] - dxy * az_00 * v[3]
-            + dxz * ay_0m * v[4] - dxz * ay_00 * v[5];
-        Av[2] = diag2 * v[2]
-            - dxy * az_mm * v[0] + dxy * az_0m * v[1]
-            - dyz * ax_mm * v[4] + dyz * ax_m0 * v[5];
-        Av[3] = diag3 * v[3]
-            + dxy * az_m0 * v[0] - dxy * az_00 * v[1]
-            + dyz * ax_0m * v[4] - dyz * ax_00 * v[5];
-        Av[4] = diag4 * v[4]
-            - dxz * ay_mm * v[0] + dxz * ay_0m * v[1]
-            - dyz * ax_mm * v[2] + dyz * ax_0m * v[3];
-        Av[5] = diag5 * v[5]
-            + dxz * ay_m0 * v[0] - dxz * ay_00 * v[1]
-            + dyz * ax_m0 * v[2] - dyz * ax_00 * v[3];
-    };
-    Real sol[6] = {0, 0, 0, 0, 0, 0};
-    pcg_solve<6>(sol, b.data(), mat, precond, 8, Real(1.e-8));
-    ex(i-1,j  ,k  ) = sol[0];
-    ex(i  ,j  ,k  ) = sol[1];
-    ey(i  ,j-1,k  ) = sol[2];
-    ey(i  ,j  ,k  ) = sol[3];
-    ez(i  ,j  ,k-1) = sol[4];
-    ez(i  ,j  ,k  ) = sol[5];
-#endif
-}
-
 #endif
 
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
@@ -2071,14 +1307,71 @@ void mlcurlcurl_restriction (int dir, int i, int j, int k,
 #elif (AMREX_SPACEDIM == 1)
         if (dir == 0) {
             crse(i,0,0) = Real(0.5) * (fine(ii,0,0) + fine(ii+1,0,0));
-        } else if (i == 0 && dir == 2 && dinfo.coord == 1) {
-            crse(0,0,0) = Real(0.5) * (fine(0,0,0) + fine(1,0,0));
         } else {
             crse(i,0,0) = Real(0.25) * (fine(ii-1,0,0)             +
                                         fine(ii  ,0,0) * Real(2.0) +
                                         fine(ii+1,0,0));
         }
 #endif
+    }
+}
+
+/**
+ * \brief Interpolate coarse edge data to fine edge — set (not add).
+ *
+ * Same interpolation logic as mlcurlcurl_interpadd but assigns (=)
+ * instead of accumulates (+=). Used for filling C/F ghost cells.
+ */
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+void mlcurlcurl_interpset (int dir, int i, int j, int k,
+                           Array4<Real> const& fine,
+                           Array4<Real const> const& crse)
+{
+    int ic = amrex::coarsen(i,2);
+    int jc = amrex::coarsen(j,2);
+    int kc = amrex::coarsen(k,2);
+    if (dir == 0) {
+        bool j_is_odd = (jc*2 != j);
+        bool k_is_odd = (kc*2 != k);
+        if (j_is_odd && k_is_odd) {
+            fine(i,j,k) = Real(0.25) *
+                (crse(ic,jc,kc  ) + crse(ic,jc+1,kc  ) +
+                 crse(ic,jc,kc+1) + crse(ic,jc+1,kc+1));
+        } else if (j_is_odd) {
+            fine(i,j,k) = Real(0.5) * (crse(ic,jc,kc) + crse(ic,jc+1,kc));
+        } else if (k_is_odd) {
+            fine(i,j,k) = Real(0.5) * (crse(ic,jc,kc) + crse(ic,jc,kc+1));
+        } else {
+            fine(i,j,k) = crse(ic,jc,kc);
+        }
+    } else if (dir == 1) {
+        bool i_is_odd = (ic*2 != i);
+        bool k_is_odd = (kc*2 != k);
+        if (i_is_odd && k_is_odd) {
+            fine(i,j,k) = Real(0.25) *
+                (crse(ic  ,jc,kc  ) + crse(ic+1,jc,kc  ) +
+                 crse(ic  ,jc,kc+1) + crse(ic+1,jc,kc+1));
+        } else if (i_is_odd) {
+            fine(i,j,k) = Real(0.5) * (crse(ic,jc,kc) + crse(ic+1,jc,kc));
+        } else if (k_is_odd) {
+            fine(i,j,k) = Real(0.5) * (crse(ic,jc,kc) + crse(ic,jc,kc+1));
+        } else {
+            fine(i,j,k) = crse(ic,jc,kc);
+        }
+    } else {
+        bool i_is_odd = (ic*2 != i);
+        bool j_is_odd = (jc*2 != j);
+        if (i_is_odd && j_is_odd) {
+            fine(i,j,k) = Real(0.25) *
+                (crse(ic  ,jc  ,kc) + crse(ic+1,jc  ,kc) +
+                 crse(ic  ,jc+1,kc) + crse(ic+1,jc+1,kc));
+        } else if (i_is_odd) {
+            fine(i,j,k) = Real(0.5) * (crse(ic,jc,kc) + crse(ic+1,jc,kc));
+        } else if (j_is_odd) {
+            fine(i,j,k) = Real(0.5) * (crse(ic,jc,kc) + crse(ic,jc+1,kc));
+        } else {
+            fine(i,j,k) = crse(ic,jc,kc);
+        }
     }
 }
 

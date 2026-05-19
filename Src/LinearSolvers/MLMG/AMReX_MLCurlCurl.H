@@ -10,10 +10,8 @@ namespace amrex {
 /**
  * \brief curl (alpha curl E) + beta E = rhs
  *
- * Here E is an Array of 3 MultiFabs on the staggered grid.  The coefficient
- * \f$\alpha\f$ can be supplied either as a positive scalar (via setScalars)
- * or as a nodal MultiFab (via setAlpha), and \f$\beta\f$ can be either a
- * non-negative scalar or an edge-centered MultiFab (via setBeta).
+ * Here E is an Array of 3 MultiFabs on staggered grid, alpha is a positive
+ * scalar, and beta is either a non-negative scalar or a MultiFab.
  *
  * It's the caller's responsibility to make sure rhs has consistent nodal
  * data. If needed, one could call prepareRHS for this.
@@ -22,6 +20,8 @@ namespace amrex {
  * et. al. 2020.  "An Efficient Preconditioner for 3-D Finite Difference
  * Modeling of the Electromagnetic Diffusion Process in the Frequency
  * Domain", IEEE Transactions on Geoscience and Remote Sensing, 58, 500-509.
+ *
+ * Supports composite solves across multiple AMR levels.
  */
 class MLCurlCurl
     : public MLLinOpT<Array<MultiFab,3> >
@@ -38,29 +38,17 @@ public:
     MLCurlCurl (const Vector<Geometry>& a_geom,
                 const Vector<BoxArray>& a_grids,
                 const Vector<DistributionMapping>& a_dmap,
-                const LPInfo& a_info = LPInfo(),
-                int a_coord = 0);
+                const LPInfo& a_info = LPInfo());
 
     void define (const Vector<Geometry>& a_geom,
                  const Vector<BoxArray>& a_grids,
                  const Vector<DistributionMapping>& a_dmap,
-                 const LPInfo& a_info = LPInfo(),
-                 int a_coord = 0);
+                 const LPInfo& a_info = LPInfo());
 
-    //! Set scalar coefficients.  This clears any previously supplied nodal alpha
-    //! or edge-centered beta MultiFabs, so call setAlpha/setBeta afterwards if
-    //! you still need spatially varying coefficients.
     void setScalars (RT a_alpha, RT a_beta) noexcept;
 
-    //! This is needed only if there is variable beta coefficient.  Call this
-    //! after setScalars if both APIs are used, because setScalars clears the
-    //! cached beta MultiFabs.
+    //! This is needed only if there is variable beta coefficient.
     void setBeta (const Vector<Array<MultiFab const*,3>>& a_bcoefs);
-
-    //! Set variable alpha defined on nodal MultiFab.  Call this after
-    //! setScalars if both APIs are used, because setScalars clears the cached
-    //! nodal alpha fields.
-    void setAlpha (const Vector<MultiFab const*>& a_acoeffs);
 
     //! Synchronize RHS on nodal points. If the user can guarantee it, this
     //! function does not need to be called.
@@ -103,8 +91,6 @@ public:
 
     void prepareForSolve () override;
 
-    void preparePrecond () override;
-
     [[nodiscard]] bool isSingular (int /*amrlev*/) const override { return false; }
     [[nodiscard]] bool isBottomSingular () const override { return false; }
 
@@ -113,6 +99,22 @@ public:
     [[nodiscard]] RT normInf (int amrlev, MF const& mf, bool local) const override;
 
     void averageDownAndSync (Vector<MF>& sol) const override;
+
+    //! Average fine-level solution and RHS down to coarse level.
+    void averageDownSolutionRHS (int camrlev, MF& crse_sol, MF& crse_rhs,
+                                 const MF& fine_sol, const MF& fine_rhs) override;
+
+    //! Restrict fine residual to covered coarse edges.
+    void avgDownResAmr (int clev, MF& cres, MF const& fres) const override;
+
+    //! Prolongate coarse AMR correction to fine AMR level.
+    void interpolationAmr (int famrlev, MF& fine, const MF& crse,
+                           IntVect const& nghost) const override;
+
+    //! Fix coarse residual at fringe edges (C/F boundary).
+    void reflux (int crse_amrlev, MF& res,
+                 const MF& crse_sol, const MF& crse_rhs,
+                 MF& fine_res, MF& fine_sol, const MF& fine_rhs) const override;
 
     [[nodiscard]] IntVect getNGrowVectRestriction () const override {
         return IntVect(1);
@@ -142,20 +144,31 @@ public:
 
 private:
 
-    void applyBC (int amrlev, int mglev, MF& in, CurlCurlStateType type) const;
+    //! Fill ghost cells: FillBoundary + physical BC + CF BC.
+    //! When homogeneous is true, CF ghosts are filled with zero
+    //! (correction equation). When false, they are filled from stored
+    //! coarse data (solution equation).
+    void applyBC (int amrlev, int mglev, MF& in, CurlCurlStateType type,
+                  bool homogeneous = false) const;
+
+    //! Fill CF ghost cells using m_cfmask to avoid corrupting same-level
+    //! neighbor ghosts. When homogeneous is true, writes zero. When false,
+    //! interpolates from m_crse_sol_br.
+    void fillCoarseFineBoundary (int amrlev, MF& mf, bool homogeneous) const;
+
+    //! Build CF masks for all AMR/MG levels.
+    void buildCFMasks ();
+
+    //! Build fine coverage masks for all AMR levels except the finest.
+    void buildFineMask ();
 
     [[nodiscard]] iMultiFab const& getDotMask (int amrlev, int mglev, int idim) const;
+    [[nodiscard]] iMultiFab const& getFineMask (int amrlev, int idim) const;
 
     [[nodiscard]] CurlCurlDirichletInfo getDirichletInfo (int amrlev, int mglev) const;
     [[nodiscard]] CurlCurlSymmetryInfo getSymmetryInfo (int amrlev, int mglev) const;
 
     void update_lusolver ();
-
-    void set_curvilinear_domain_bc ();
-    void clearAlphaMultiFab ();
-    void clearBetaMultiFab ();
-
-    int m_coord = 0;
 
     RT m_alpha = std::numeric_limits<RT>::lowest();
     RT m_beta  = std::numeric_limits<RT>::lowest();
@@ -174,9 +187,25 @@ private:
     Vector<Vector<std::unique_ptr<Gpu::DeviceScalar
                                   <LUSolver<AMREX_SPACEDIM*2,RT>>>>> m_lusolver;
     Vector<Vector<Array<std::unique_ptr<MultiFab>,3>>> m_bcoefs;
-    Vector<Vector<Array<std::unique_ptr<MultiFab>,3>>> m_acoefs;
     bool m_use_pcg = false;
     bool m_needs_update = true;
+
+    // --- Multilevel AMR support ---
+
+    //! CF masks: 0=valid or same-level neighbor ghost, 1=true CF ghost.
+    //! [amrlev][mglev][idim], 1 ghost cell.
+    Vector<Vector<Array<std::unique_ptr<iMultiFab>,3>>> m_cfmask;
+
+    //! Coarse solution on coarsened-fine layout for CF ghost interpolation.
+    //! [amrlev][idim], with 1 ghost cell. Only for amrlev > 0.
+    Vector<Array<std::unique_ptr<MultiFab>,3>> m_crse_sol_br;
+
+    //! Whether m_crse_sol_br holds valid data.
+    mutable Vector<int> m_has_cf_data;
+
+    //! Fine coverage mask: 0=covered by finer level, 1=not covered.
+    //! [amrlev][idim]. Only for amrlev < finest.
+    mutable Vector<Array<std::unique_ptr<iMultiFab>,3>> m_fine_mask;
 };
 
 }
