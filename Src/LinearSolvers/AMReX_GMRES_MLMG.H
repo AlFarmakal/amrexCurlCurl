@@ -68,6 +68,9 @@ public:
     //! Cap the number of GMRES iterations executed per solve to \p niters.
     void setMaxIters (int niters) { m_gmres.setMaxIters(niters); }
 
+    //! Number of Krylov vectors retained between restarts.
+    void setRestartLength (int rl) { m_gmres.setRestartLength(rl); }
+
     //! Number of iterations executed by the last solve().
     [[nodiscard]] int getNumIters () const { return m_gmres.getNumIters(); }
 

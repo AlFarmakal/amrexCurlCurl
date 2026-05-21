@@ -110,6 +110,15 @@ public:
 
     [[nodiscard]] RT normInf (int amrlev, MF const& mf, bool local) const override;
 
+    //! Multi-AMR-level dot product for GMRESMLMG. Sums xdoty over all
+    //! AMR levels (each xdoty excludes covered coarse edges via the
+    //! AMR fine_mask), then reduces across MPI ranks.
+    RT dotProductPrecond (Vector<MF const*> const& x,
+                          Vector<MF const*> const& y) const override;
+
+    //! Multi-AMR-level L2 norm for GMRESMLMG.
+    RT norm2Precond (Vector<MF const*> const& x) const override;
+
     void averageDownAndSync (Vector<MF>& sol) const override;
 
     //! Average fine-level solution and RHS down to coarse level.
@@ -153,6 +162,19 @@ public:
     void compresid (int amrlev, int mglev, MF& resid, MF const& b) const;
 
     void applyPhysBC (int amrlev, int mglev, MultiFab& mf, CurlCurlStateType type) const;
+
+    //! Galerkin operator action on the AMR-coarsened covered region.
+    //! Computes (R L^f I) v at covered coarse cells, writing into Ax_c.
+    //! Used to make the coarse operator at cov variationally consistent
+    //! with the fine operator — necessary for stable composite V-cycles
+    //! on curl-curl with small β in free space.
+    void applyAmrLevelGalerkin (int crse_amrlev, MF& Ax_c, MF const& v_c) const;
+
+    //! Damped-Jacobi smoother pass at AMR-covered cells using the
+    //! Galerkin operator action. Run after the standard 4-block GS to
+    //! make the smoother consistent with apply() at cov, so the V-cycle
+    //! on the AMR-coarse level contracts.
+    void smoothCovGalerkinJacobi (int amrlev, MF& sol, MF const& rhs) const;
 
 private:
 
@@ -214,7 +236,10 @@ private:
 
     //! Coarse solution on coarsened-fine layout for CF ghost interpolation.
     //! [amrlev][idim], with 1 ghost cell. Only for amrlev > 0.
-    Vector<Array<std::unique_ptr<MultiFab>,3>> m_crse_sol_br;
+    //! Marked mutable so applyAmrLevelGalerkin (const) can temporarily
+    //! populate it with the coarse vector during a Galerkin action and
+    //! restore afterwards.
+    mutable Vector<Array<std::unique_ptr<MultiFab>,3>> m_crse_sol_br;
 
     //! Whether m_crse_sol_br holds valid data.
     mutable Vector<int> m_has_cf_data;

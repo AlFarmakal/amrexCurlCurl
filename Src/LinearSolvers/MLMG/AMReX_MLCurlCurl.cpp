@@ -19,6 +19,19 @@ void MLCurlCurl::define (const Vector<Geometry>& a_geom,
 {
     MLLinOpT<MF>::define(a_geom, a_grids, a_dmap, a_info, {});
 
+    // Curl-curl is edge-centered (each E component lives on a distinct
+    // edge type). The MLLinOp base treats an unset m_ixtype = (0,0,0)
+    // as cell-centered, which makes MLMG::apply call cell-centered
+    // average_down routines on the AMR-cov region — aborting for
+    // non-MultiFab MF (Array<MultiFab,3>) when used as GMRES
+    // preconditioner. Set m_ixtype to a non-cell value (any non-zero
+    // IntVect suffices) so isCellCentered() returns false and
+    // MLMG::apply skips the cell-centered average_down path.
+    // (For non-GMRES paths this is harmless — m_ixtype only feeds
+    // isCellCentered and the default MLLinOpT::make* methods which
+    // MLCurlCurl overrides.)
+    this->m_ixtype = IntVect::TheNodeVector();
+
     m_dotmask.resize(this->m_num_amr_levels);
     for (int amrlev = 0; amrlev < m_num_amr_levels; ++amrlev) {
         m_dotmask[amrlev].resize(this->m_num_mg_levels[amrlev]);
@@ -504,6 +517,12 @@ void MLCurlCurl::fillCoarseFineBoundary (int amrlev, MF& mf,
 {
     if (m_cfmask[amrlev][0][0] == nullptr) { return; }
 
+    // mf may be a 0-ghost MultiFab (e.g., GMRES Krylov vector allocated
+    // via makeVecRHS). CF-ghost fill writes into the +1 ghost, which
+    // would be out-of-bounds; consumers of such a 0-ghost MF do not
+    // read ghosts anyway, so skip.
+    if (mf[0].nGrow() < 1) { return; }
+
 #if MLCC_CF_GALERKIN
     IntVect ratio;
     if (amrlev == 0) {
@@ -609,6 +628,248 @@ void MLCurlCurl::applyBC (int amrlev, int mglev, MF& in,
     for (auto* mf : mfs) {
         applyPhysBC(amrlev, mglev, *mf, type);
     }
+}
+
+// ========================================================================
+// applyAmrLevelGalerkin — matrix-free (R L^f I) action at AMR-covered cells
+// ========================================================================
+//
+// For staggered curl-curl with small β in free space, the AMR-coarsened
+// rediscretized L^c is NOT variationally consistent with avg-down(L^f).
+// The off-diagonal Ex–Ey cross-couplings of L_G = R L^f I differ
+// structurally from L^c (Galerkin halves the same-cell coupling and
+// zeros the cross-cell coupling that L^c writes as -α/dx/dy). This
+// inconsistency, combined with the gradient null space of curl-curl
+// (eigenvalue β = 0.001 in free space ⇒ |L^c⁻¹| ≈ 1000 along
+// gradient modes), turns the V-cycle's cor at AMR-covered cells into
+// inconsistent gradient-mode noise that diverges the iteration.
+//
+// This routine restores variational consistency by computing the
+// Galerkin operator action directly: interpolate v from coarse to fine
+// (mlcurlcurl_interpset), apply L^f via the fine-level apply (which
+// fills CF ghosts from v), then restrict back (mlcurlcurl_restriction).
+// The result is written into Ax_c at AMR-covered coarse cells via
+// ParallelCopy from the coarsened-fine layout — uncov cells of Ax_c
+// are untouched.
+//
+// Cost: one extra fine-level apply per V-cycle apply on the AMR-coarse
+// level. Roughly doubles the cost of the V-cycle.
+//
+void MLCurlCurl::applyAmrLevelGalerkin (int crse_amrlev, MF& Ax_c,
+                                        MF const& v_c) const
+{
+    BL_PROFILE("MLCurlCurl::applyAmrLevelGalerkin()");
+
+    AMREX_ASSERT(crse_amrlev + 1 < m_num_amr_levels);
+
+    int const flev = crse_amrlev + 1;
+    IntVect const ratio(this->AMRRefRatio(crse_amrlev));
+    AMREX_ALWAYS_ASSERT(ratio == 2);
+
+    // Save state of m_crse_sol_br[flev] and m_has_cf_data[flev]. We
+    // temporarily overwrite them so apply(flev, ...) below fills CF
+    // ghosts from v_c. Restore on exit.
+    int const saved_has_cf = m_has_cf_data[flev];
+    Array<MultiFab,3> saved_brdata;
+    bool const brdata_was_alloc = (m_crse_sol_br[flev][0] != nullptr);
+    if (brdata_was_alloc) {
+        for (int idim = 0; idim < 3; ++idim) {
+            saved_brdata[idim].define(m_crse_sol_br[flev][idim]->boxArray(),
+                                      m_crse_sol_br[flev][idim]->DistributionMap(),
+                                      1, 1);
+            MultiFab::Copy(saved_brdata[idim], *m_crse_sol_br[flev][idim],
+                           0, 0, 1, IntVect(1));
+        }
+    } else {
+        BoxArray crse_ba = m_grids[flev][0];
+        crse_ba.coarsen(ratio);
+        for (int idim = 0; idim < 3; ++idim) {
+            m_crse_sol_br[flev][idim] = std::make_unique<MultiFab>
+                (amrex::convert(crse_ba, m_etype[idim]),
+                 m_dmap[flev][0], 1, 1);
+        }
+    }
+
+    // Populate m_crse_sol_br[flev] from v_c. setVal(0) first so any
+    // dest cells (e.g. ghosts outside the source's valid domain) that
+    // ParallelCopy doesn't touch are well-defined rather than picking
+    // up uninitialised memory from a freshly-allocated MultiFab.
+    for (int idim = 0; idim < 3; ++idim) {
+        m_crse_sol_br[flev][idim]->setVal(Real(0.0));
+        m_crse_sol_br[flev][idim]->ParallelCopy(
+            v_c[idim], 0, 0, 1,
+            IntVect(0), IntVect(1),
+            m_geom[crse_amrlev][0].periodicity());
+    }
+    m_has_cf_data[flev] = 1;
+
+    // Build Iv (= I v_c) on fine layout with 1 ghost. Use the
+    // interpolation kernel mlcurlcurl_interpset to fill valid fine
+    // cells from m_crse_sol_br[flev]. Fine CF ghosts and other ghosts
+    // are left at 0 here; they will be filled correctly by applyBC
+    // inside the apply(flev, ...) call below (which fires
+    // fillCoarseFineBoundary from m_crse_sol_br[flev] and
+    // FillBoundary + applyPhysBC).
+    //
+    // Iteration must stay within m_crse_sol_br[flev]'s valid+1 ghost
+    // range: interpset can read up to (ic+1, jc+1) from a fine cell at
+    // (i, j) → max coarse index read = coarsen(i_fine_max, 2) + 1.
+    // Iterating ng=0 (valid only) keeps the coarse reads within bounds.
+    Array<MultiFab,3> Iv;
+    for (int idim = 0; idim < 3; ++idim) {
+        Iv[idim].define(amrex::convert(m_grids[flev][0], m_etype[idim]),
+                        m_dmap[flev][0], 1, 1);
+        Iv[idim].setVal(Real(0.0));
+
+        auto const& iv_a = Iv[idim].arrays();
+        auto const& crse_a = m_crse_sol_br[flev][idim]->const_arrays();
+        int const dir = idim;
+        ParallelFor(Iv[idim], IntVect(0),
+            [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k)
+        {
+            mlcurlcurl_interpset(dir, i, j, k, iv_a[bno], crse_a[bno]);
+        });
+    }
+    Gpu::streamSynchronize();
+
+    // L^f Iv on fine layout. apply() will fire applyBC, which sets CF
+    // ghosts from m_crse_sol_br[flev] (= v_c). The CF ghosts we just
+    // filled via interpset are overwritten, but with the same values.
+    //
+    // Allocate Lf_Iv with 1 ghost: the subsequent restriction kernel
+    // mlcurlcurl_restriction reads fine cells at (ii±1, jj±1, kk±1)
+    // (nodal restriction has the widest reach), so coarse cells at the
+    // boundary of the coarsened-fine BA need the +1 fine-ghost cells.
+    // setVal(0) on the ghosts; apply() writes valid only, and 0 ghost
+    // values give the natural zero-extension for the restriction at
+    // the coarsened-fine BA boundary.
+    MF Lf_Iv;
+    for (int idim = 0; idim < 3; ++idim) {
+        Lf_Iv[idim].define(amrex::convert(m_grids[flev][0], m_etype[idim]),
+                           m_dmap[flev][0], 1, 1);
+        Lf_Iv[idim].setVal(Real(0.0));
+    }
+    apply(flev, 0, Lf_Iv, Iv, BCMode::Inhomogeneous, StateMode::Solution);
+
+    // R Lf_Iv on coarsened-fine layout.
+    BoxArray cba = m_grids[flev][0]; cba.coarsen(ratio);
+    auto dinfo = getDirichletInfo(flev, 0);
+    Array<MultiFab,3> R_Lf_Iv;
+    for (int idim = 0; idim < 3; ++idim) {
+        R_Lf_Iv[idim].define(amrex::convert(cba, m_etype[idim]),
+                             m_dmap[flev][0], 1, 0);
+        auto const& crsema = R_Lf_Iv[idim].arrays();
+        auto const& finema = Lf_Iv[idim].const_arrays();
+        int const dir = idim;
+        ParallelFor(R_Lf_Iv[idim],
+            [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k)
+        {
+            mlcurlcurl_restriction(dir, i, j, k,
+                                   crsema[bno], finema[bno], dinfo);
+        });
+    }
+    Gpu::streamSynchronize();
+
+    // Write into Ax_c at AMR-covered cells via ParallelCopy.
+    for (int idim = 0; idim < 3; ++idim) {
+        Ax_c[idim].ParallelCopy(R_Lf_Iv[idim], 0, 0, 1);
+    }
+
+    // Restore m_crse_sol_br[flev] and m_has_cf_data[flev].
+    if (brdata_was_alloc) {
+        for (int idim = 0; idim < 3; ++idim) {
+            MultiFab::Copy(*m_crse_sol_br[flev][idim], saved_brdata[idim],
+                           0, 0, 1, IntVect(1));
+        }
+    } else {
+        for (int idim = 0; idim < 3; ++idim) {
+            m_crse_sol_br[flev][idim]->setVal(Real(0.0));
+        }
+    }
+    m_has_cf_data[flev] = saved_has_cf;
+}
+
+// ========================================================================
+// smoothCovGalerkinJacobi — damped Jacobi at AMR-covered cells using
+// the Galerkin operator. Pair this with the existing 4-block GS so the
+// smoother is consistent with apply() at both uncov and cov.
+// ========================================================================
+void MLCurlCurl::smoothCovGalerkinJacobi (int amrlev, MF& sol, MF const& rhs) const
+{
+    BL_PROFILE("MLCurlCurl::smoothCovGalerkinJacobi()");
+
+    // L_G[sol] on the coarse layout (overwrites only cov cells).
+    MF Lg_sol;
+    for (int idim = 0; idim < 3; ++idim) {
+        Lg_sol[idim].define(sol[idim].boxArray(),
+                            sol[idim].DistributionMap(), 1, 0);
+        Lg_sol[idim].setVal(Real(0.0));
+    }
+    applyAmrLevelGalerkin(amrlev, Lg_sol, sol);
+
+    // Damped Jacobi at cov:
+    //   sol_cov += omega * (rhs_cov - L_G sol_cov) / diag
+    // The rediscretized diagonal is a close approximation to the
+    // Galerkin diagonal in our regime (the dominant Galerkin
+    // correction is in off-diagonal cross-couplings).
+    auto dxinv = this->m_geom[amrlev][0].InvCellSizeArray();
+    auto adxinv = dxinv;
+    for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
+        adxinv[idim] *= std::sqrt(m_alpha);
+    }
+    Real const dxx = adxinv[0] * adxinv[0];
+#if (AMREX_SPACEDIM >= 2)
+    Real const dyy = adxinv[1] * adxinv[1];
+#else
+    Real const dyy = Real(0.0);
+#endif
+#if (AMREX_SPACEDIM == 3)
+    Real const dzz = adxinv[2] * adxinv[2];
+#else
+    Real const dzz = Real(0.0);
+#endif
+    Real const b_scalar = m_beta;
+    bool const has_beta = (m_bcoefs[amrlev][0][0] != nullptr);
+
+    auto dinfo = getDirichletInfo(amrlev, 0);
+    static Real const omega = [] {
+        char const* s = std::getenv("AMREX_MLCC_JACOBI_OMEGA");
+        return s ? Real(std::atof(s)) : Real(0.5);
+    }();
+
+    for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
+        auto const& sol_a  = sol[idim].arrays();
+        auto const& rhs_a  = rhs[idim].const_arrays();
+        auto const& lg_a   = Lg_sol[idim].const_arrays();
+        auto const& fmask  = m_fine_mask[amrlev][idim]->const_arrays();
+        Array4<Real const> empty;
+        auto const& beta_a = has_beta
+            ? m_bcoefs[amrlev][0][idim]->const_arrays()
+            : MultiArray4<Real const>{};
+        int const dir = idim;
+        // Per-edge rediscretized diagonal:
+        //   Ex (idim=0): 2*dyy (+ 2*dzz in 3D) + β
+        //   Ey (idim=1): 2*dxx (+ 2*dzz in 3D) + β
+        //   Ez (idim=2): 2*(dxx + dyy) + β   (only 2D here for now)
+        Real const diag_curl =
+            (idim == 0) ? Real(2.0)*(dyy + dzz)
+          : (idim == 1) ? Real(2.0)*(dxx + dzz)
+          :               Real(2.0)*(dxx + dyy);
+
+        ParallelFor(sol[idim],
+            [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k)
+        {
+            // cov cells only (fmask == 0 means covered by finer level).
+            if (fmask[bno](i,j,k) != 0) return;
+            if (dinfo.is_dirichlet_edge(dir, i, j, k)) return;
+
+            Real const beta_local = has_beta ? beta_a[bno](i,j,k) : b_scalar;
+            Real const diag = diag_curl + beta_local;
+            Real const r = rhs_a[bno](i,j,k) - lg_a[bno](i,j,k);
+            sol_a[bno](i,j,k) += omega * r / diag;
+        });
+    }
+    Gpu::streamSynchronize();
 }
 
 // ========================================================================
@@ -872,12 +1133,8 @@ MLCurlCurl::apply (int amrlev, int mglev, MF& out, MF& in, BCMode bc_mode,
         // AMR levels with CF ghosts. Matches the kernel-level correction
         // applied inside smooth4's HasCF block — the operator must be
         // consistent with the smoother for the V-cycle to converge.
-        // At mglev=0 we skip (fine-level stencil is physically correct
-        // as-is; reflux handles cross-AMR coupling).
-        // cfmask existence alone gates this — it's set at amrlev>0 in the
-        // genuine multilevel case, or at amrlev==0 when the caller supplied
-        // setCoarseFineBC on a single-level MLCurlCurl. mglev>0 keeps the
-        // finest level untouched (its physical stencil is correct as-is).
+        // At mglev=0 we skip the diagonal correction here; the
+        // applyAmrLevelGalerkin call below handles AMR-cov consistency.
         if (mglev > 0 && m_cfmask[amrlev][mglev][0] != nullptr)
         {
             auto const& exm = m_cfmask[amrlev][mglev][0]->const_array(mfi);
@@ -931,6 +1188,34 @@ MLCurlCurl::apply (int amrlev, int mglev, MF& out, MF& in, BCMode bc_mode,
 #endif
 #endif
     }
+
+#if MLCC_CF_GALERKIN
+#if (AMREX_SPACEDIM >= 2)
+    // At mglev=0 on a non-finest AMR level, override Ax at the
+    // AMR-covered region with the algebraic Galerkin action R L^f I
+    // applied to in. This makes the AMR-coarse operator variationally
+    // consistent with the fine operator over cov, removing the
+    // wrong-direction component of V-cycle corrections that otherwise
+    // drive composite divergence on jagged CF geometries.
+    // Opt-in via env var; default off because (a) alone doesn't restore
+    // composite-V-cycle convergence on curl-curl with small β in free
+    // space — the 4-block edge GS smoother cannot damp the gradient
+    // null space, so even a variationally-consistent operator at cov
+    // does not give a contractive V-cycle. Documented in the analysis
+    // file; needs a Hiptmair-style smoother to be useful.
+    static int s_mlcc_galerkin_amr = [] {
+        char const* s = std::getenv("AMREX_MLCC_AMR_GALERKIN");
+        return s ? std::atoi(s) : 0;
+    }();
+    if (s_mlcc_galerkin_amr
+        && mglev == 0
+        && amrlev < m_num_amr_levels - 1
+        && m_fine_mask[amrlev][0] != nullptr)
+    {
+        applyAmrLevelGalerkin(amrlev, out, in);
+    }
+#endif
+#endif
 }
 
 // ========================================================================
@@ -963,6 +1248,34 @@ void MLCurlCurl::smooth (int amrlev, int mglev, MF& sol, const MF& rhs,
             smooth4(amrlev, mglev, sol, rhs, color);
 #endif
         }
+
+#if MLCC_CF_GALERKIN
+#if (AMREX_SPACEDIM >= 2)
+        // After one full multi-color GS sweep, add a damped-Jacobi pass
+        // at AMR-covered cells using the Galerkin operator R L^f I to
+        // match the apply() operator at cov. Without this, smooth4
+        // (rediscretized) and apply (Galerkin at cov) disagree → V-cycle
+        // does not contract.
+        //
+        // We compute L_G[sol] via applyAmrLevelGalerkin into a temporary,
+        // then update sol_cov += omega * (rhs - L_G sol) / diag, where
+        // diag is the rediscretized diagonal (a close approximation to
+        // the Galerkin diagonal in our regime — the dominant Galerkin
+        // correction is in off-diagonal cross-couplings, not the
+        // diagonal).
+        static int s_smooth_cov_galerkin = [] {
+            char const* s = std::getenv("AMREX_MLCC_SMOOTH_COV_GALERKIN");
+            return s ? std::atoi(s) : 0;
+        }();
+        if (s_smooth_cov_galerkin
+            && mglev == 0
+            && amrlev < m_num_amr_levels - 1
+            && m_fine_mask[amrlev][0] != nullptr)
+        {
+            smoothCovGalerkinJacobi(amrlev, sol, rhs);
+        }
+#endif
+#endif
     }
 }
 
@@ -1403,15 +1716,36 @@ void MLCurlCurl::avgDownResAmr (int clev, MF& cres, MF const& fres) const
     IntVect ratio(this->AMRRefRatio(clev));
     auto dinfo = getDirichletInfo(flev, 0);
 
+    // mlcurlcurl_restriction reads fres at (ii±1, jj±1, kk±1). Coarse
+    // cells at the boundary of the coarsened-fine BoxArray need the +1
+    // fine-side ghost. Most callers pass fres with ≥1 ghost; GMRES's
+    // makeVecRHS allocates 0-ghost vectors though, so when MLMG::apply
+    // routes through this routine the fres argument may have no
+    // ghosts. In that case, materialise a local 1-ghost copy with
+    // zero-extended ghosts so the restriction stencil reads in bounds.
+    bool const need_ghost_copy = (fres[0].nGrow() < 1);
+    MF fres_local;
+    MF const* pfres = &fres;
+    if (need_ghost_copy) {
+        for (int idim = 0; idim < 3; ++idim) {
+            fres_local[idim].define(fres[idim].boxArray(),
+                                    fres[idim].DistributionMap(), 1, 1);
+            fres_local[idim].setVal(Real(0.0));
+            MultiFab::Copy(fres_local[idim], fres[idim], 0, 0, 1, IntVect(0));
+        }
+        pfres = &fres_local;
+    }
+    MF const& fres_use = *pfres;
+
     for (int idim = 0; idim < 3; ++idim) {
-        BoxArray cfba = fres[idim].boxArray();
+        BoxArray cfba = fres_use[idim].boxArray();
         cfba.coarsen(ratio);
 
         MultiFab crse_from_fine(amrex::convert(cfba, m_etype[idim]),
-                                fres[idim].DistributionMap(), 1, 0);
+                                fres_use[idim].DistributionMap(), 1, 0);
 
         auto const& crsema = crse_from_fine.arrays();
-        auto const& finema = fres[idim].const_arrays();
+        auto const& finema = fres_use[idim].const_arrays();
         ParallelFor(crse_from_fine,
             [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k)
         {
@@ -1500,8 +1834,28 @@ void MLCurlCurl::averageDownAndSync (Vector<MF>& sol) const
 }
 
 // ========================================================================
-// xdoty, normInf — exclude covered coarse edges
+// xdoty, normInf, dotProductPrecond, norm2Precond — exclude covered
+// coarse edges. The *Precond variants are multi-AMR-level (sum over
+// AMR levels) and are used by GMRESMLMG when MLMG is used as a
+// preconditioner inside an outer Krylov method.
 // ========================================================================
+
+Real MLCurlCurl::dotProductPrecond (Vector<MF const*> const& x,
+                                    Vector<MF const*> const& y) const
+{
+    Real local_sum = Real(0.0);
+    for (int alev = 0; alev < m_num_amr_levels; ++alev) {
+        local_sum += xdoty(alev, 0, *x[alev], *y[alev], /*local=*/true);
+    }
+    ParallelAllReduce::Sum(local_sum, ParallelContext::CommunicatorSub());
+    return local_sum;
+}
+
+Real MLCurlCurl::norm2Precond (Vector<MF const*> const& x) const
+{
+    Real s = dotProductPrecond(x, x);
+    return std::sqrt(s);
+}
 
 Real MLCurlCurl::xdoty (int amrlev, int mglev, const MF& x, const MF& y,
                         bool local) const

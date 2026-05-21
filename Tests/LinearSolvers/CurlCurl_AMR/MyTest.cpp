@@ -12,6 +12,7 @@
 #include "MyTest.H"
 #include "initProb_K.H"
 
+#include <AMReX_GMRES_MLMG.H>
 #include <AMReX_MLABecLaplacian.H>
 #include <AMReX_MLMG.H>
 #include <AMReX_ParmParse.H>
@@ -388,18 +389,47 @@ MyTest::solve ()
 
   Real tol_abs = Real(0.0);
 
-  // Solve mode: composite (default) or level-by-level.
+  // Solve mode: composite (default), level-by-level, or GMRES-wrapped.
+  // composite=2: GMRES outer iteration with MLMG as preconditioner.
+  //   Stabilizes the iteration on near-singular curl-curl operators
+  //   (β << 1 in free space) where the bare MLMG V-cycle has spectral
+  //   radius > 1 along gradient modes. Pair with the Galerkin env vars
+  //   AMREX_MLCC_AMR_GALERKIN=1 and AMREX_MLCC_SMOOTH_COV_GALERKIN=1
+  //   so the preconditioner direction is variationally consistent.
   // composite=1: existing MLMG composite cross-AMR V-cycle.
   // composite=0: per-level single-AMR-level solves; coarse first, then each
   //   fine level with setCoarseFineBC pointing to the just-solved coarser
   //   level. Mirrors CNS DiffusiveMethod::globalFieldCompositeCurlCurlSolve=0.
-  bool composite = true;
+  int composite = 1;
   {
     ParmParse pp;
     pp.query("composite", composite);
   }
 
-  if (composite) {
+  if (composite == 2) {
+    GMRESMLMGT<V> gmsolver(mlmg);
+    gmsolver.setVerbose(verbose);
+    {
+      int gmres_precond_iters = 1;
+      int gmres_max_iters = max_iter;
+      // Default Krylov restart scales with AMR depth: each extra AMR
+      // level coarsening adds spectral spread to the MLMG-preconditioned
+      // operator (curl-curl gradient modes amplify ~1/β = 1000 per
+      // coarsening), so the Krylov subspace needs to be longer to damp
+      // the worst-conditioned modes between restarts. GMRES default is
+      // 30, which is plenty for 2 AMR levels but stagnates badly for 3+.
+      // Cap at 200 — beyond that the orthogonalisation cost dominates.
+      int gmres_restart = std::min(200, std::max(30, 100 * (int)geom.size()));
+      ParmParse pp;
+      pp.query("gmres_precond_iters", gmres_precond_iters);
+      pp.query("gmres_max_iters",      gmres_max_iters);
+      pp.query("gmres_restart",        gmres_restart);
+      gmsolver.setPrecondNumIters(gmres_precond_iters);
+      gmsolver.setMaxIters(gmres_max_iters);
+      gmsolver.setRestartLength(gmres_restart);
+    }
+    gmsolver.solve(sol_ptrs, rhs_const_ptrs, tol_rel, tol_abs);
+  } else if (composite == 1) {
     mlmg.solve(sol_ptrs, rhs_const_ptrs, tol_rel, tol_abs);
   } else {
     for (int lev = 0; lev < (int)geom.size(); ++lev)
