@@ -1375,6 +1375,126 @@ void mlcurlcurl_interpset (int dir, int i, int j, int k,
     }
 }
 
+/**
+ * \brief Higher-order coarse->fine edge interpolation for CF-ghost fill.
+ *
+ * Like mlcurlcurl_interpset, but second-order along the edge-tangential
+ * (cell-centred) direction instead of piecewise-constant. The lowest-order
+ * Nedelec prolongation reproduces the field only to O(dx) at the CF interface,
+ * which injects an O(1/dx) error into the fine curl-curl residual; living in
+ * the operator's gradient near-null-space, that error becomes an O(1) solution
+ * error at convex CF corners (scaling as 1/beta) and makes the composite
+ * operator inconsistent (it converges, including under a GMRES wrap, to the
+ * wrong answer for asymmetric/jagged patches).
+ *
+ * For component `dir` the edge is cell-centred in direction `dir` (tangential)
+ * and nodal in the others. The transverse (nodal) directions are interpolated
+ * exactly as before; the tangential direction adds a central-difference linear
+ * reconstruction: fine = v0 + s*0.5*(v_{+1}-v_{-1}), s=-1/4 (lower fine half),
+ * +1/4 (upper), with v_{-1},v0,v_{+1} the transverse-interpolated coarse values
+ * at tangential coarse indices t-1,t,t+1. Used only for CF-ghost fill; the MG
+ * cycle's prolongation (mlcurlcurl_interpadd) is unchanged.
+ */
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+void mlcurlcurl_interp_cfghost (int dir, int i, int j, int k,
+                                Array4<Real> const& fine,
+                                Array4<Real const> const& crse)
+{
+    int ic = amrex::coarsen(i,2);
+    int jc = amrex::coarsen(j,2);
+    int kc = amrex::coarsen(k,2);
+#if (AMREX_SPACEDIM == 1)
+    if (dir == 0) {
+        Real s = (2*ic == i) ? Real(-0.25) : Real(0.25);
+        fine(i,j,k) = crse(ic,0,0) + s*Real(0.5)*(crse(ic+1,0,0)-crse(ic-1,0,0));
+    } else {
+        bool i_odd = (2*ic != i);
+        fine(i,j,k) = i_odd ? Real(0.5)*(crse(ic,0,0)+crse(ic+1,0,0))
+                            : crse(ic,0,0);
+    }
+#elif (AMREX_SPACEDIM == 2)
+    Real s = Real(0.25);
+    Real vm1, v0, vp1;
+    if (dir == 0) {
+        bool j_odd = (2*jc != j);
+        if (j_odd) {
+            vm1 = Real(0.5)*(crse(ic-1,jc,0)+crse(ic-1,jc+1,0));
+            v0  = Real(0.5)*(crse(ic  ,jc,0)+crse(ic  ,jc+1,0));
+            vp1 = Real(0.5)*(crse(ic+1,jc,0)+crse(ic+1,jc+1,0));
+        } else {
+            vm1 = crse(ic-1,jc,0); v0 = crse(ic,jc,0); vp1 = crse(ic+1,jc,0);
+        }
+        if (2*ic == i) { s = Real(-0.25); }
+    } else if (dir == 1) {
+        bool i_odd = (2*ic != i);
+        if (i_odd) {
+            vm1 = Real(0.5)*(crse(ic,jc-1,0)+crse(ic+1,jc-1,0));
+            v0  = Real(0.5)*(crse(ic,jc  ,0)+crse(ic+1,jc  ,0));
+            vp1 = Real(0.5)*(crse(ic,jc+1,0)+crse(ic+1,jc+1,0));
+        } else {
+            vm1 = crse(ic,jc-1,0); v0 = crse(ic,jc,0); vp1 = crse(ic,jc+1,0);
+        }
+        if (2*jc == j) { s = Real(-0.25); }
+    } else {
+        bool i_odd = (2*ic != i);
+        bool j_odd = (2*jc != j);
+        if (i_odd && j_odd) {
+            fine(i,j,k) = Real(0.25)*(crse(ic,jc,0)+crse(ic+1,jc,0)
+                                     +crse(ic,jc+1,0)+crse(ic+1,jc+1,0));
+        } else if (i_odd) {
+            fine(i,j,k) = Real(0.5)*(crse(ic,jc,0)+crse(ic+1,jc,0));
+        } else if (j_odd) {
+            fine(i,j,k) = Real(0.5)*(crse(ic,jc,0)+crse(ic,jc+1,0));
+        } else {
+            fine(i,j,k) = crse(ic,jc,0);
+        }
+        return;
+    }
+    fine(i,j,k) = v0 + s*Real(0.5)*(vp1 - vm1);
+#else // 3D
+    bool i_odd = (2*ic != i);
+    bool j_odd = (2*jc != j);
+    bool k_odd = (2*kc != k);
+    Real s = Real(0.25);
+    Real vm1, v0, vp1;
+    if (dir == 0) {
+        auto T = [&] (int t) -> Real {
+            if (j_odd && k_odd) {
+                return Real(0.25)*(crse(t,jc,kc)+crse(t,jc+1,kc)
+                                  +crse(t,jc,kc+1)+crse(t,jc+1,kc+1));
+            } else if (j_odd) { return Real(0.5)*(crse(t,jc,kc)+crse(t,jc+1,kc)); }
+            else if (k_odd)   { return Real(0.5)*(crse(t,jc,kc)+crse(t,jc,kc+1)); }
+            else              { return crse(t,jc,kc); }
+        };
+        vm1 = T(ic-1); v0 = T(ic); vp1 = T(ic+1);
+        if (2*ic == i) { s = Real(-0.25); }
+    } else if (dir == 1) {
+        auto T = [&] (int t) -> Real {
+            if (i_odd && k_odd) {
+                return Real(0.25)*(crse(ic,t,kc)+crse(ic+1,t,kc)
+                                  +crse(ic,t,kc+1)+crse(ic+1,t,kc+1));
+            } else if (i_odd) { return Real(0.5)*(crse(ic,t,kc)+crse(ic+1,t,kc)); }
+            else if (k_odd)   { return Real(0.5)*(crse(ic,t,kc)+crse(ic,t,kc+1)); }
+            else              { return crse(ic,t,kc); }
+        };
+        vm1 = T(jc-1); v0 = T(jc); vp1 = T(jc+1);
+        if (2*jc == j) { s = Real(-0.25); }
+    } else {
+        auto T = [&] (int t) -> Real {
+            if (i_odd && j_odd) {
+                return Real(0.25)*(crse(ic,jc,t)+crse(ic+1,jc,t)
+                                  +crse(ic,jc+1,t)+crse(ic+1,jc+1,t));
+            } else if (i_odd) { return Real(0.5)*(crse(ic,jc,t)+crse(ic+1,jc,t)); }
+            else if (j_odd)   { return Real(0.5)*(crse(ic,jc,t)+crse(ic,jc+1,t)); }
+            else              { return crse(ic,jc,t); }
+        };
+        vm1 = T(kc-1); v0 = T(kc); vp1 = T(kc+1);
+        if (2*kc == k) { s = Real(-0.25); }
+    }
+    fine(i,j,k) = v0 + s*Real(0.5)*(vp1 - vm1);
+#endif
+}
+
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
 void mlcurlcurl_bc_symmetry (int i, int j, int k, Orientation face, IndexType it,
                              Array4<Real> const& a)

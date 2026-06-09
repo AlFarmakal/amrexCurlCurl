@@ -387,14 +387,14 @@ void MLCurlCurl::setLevelBC (int amrlev, const MF* levelbcdata,
             for (int idim = 0; idim < 3; ++idim) {
                 m_crse_sol_br[amrlev][idim] = std::make_unique<MultiFab>
                     (amrex::convert(crse_ba, m_etype[idim]),
-                     m_dmap[amrlev][0], 1, 1);
+                     m_dmap[amrlev][0], 1, 2);
             }
         }
 
         for (int idim = 0; idim < 3; ++idim) {
             m_crse_sol_br[amrlev][idim]->ParallelCopy(
                 (*this->m_coarse_data_for_bc)[idim], 0, 0, 1,
-                IntVect(0), IntVect(1),
+                IntVect(0), IntVect(2),
                 m_geom[amrlev][0].periodicity());
         }
         m_has_cf_data[amrlev] = 1;
@@ -413,7 +413,7 @@ void MLCurlCurl::setLevelBC (int amrlev, const MF* levelbcdata,
         for (int idim = 0; idim < 3; ++idim) {
             m_crse_sol_br[amrlev][idim] = std::make_unique<MultiFab>
                 (amrex::convert(crse_ba, m_etype[idim]),
-                 m_dmap[amrlev][0], 1, 1);
+                 m_dmap[amrlev][0], 1, 2);
         }
     }
 
@@ -421,7 +421,7 @@ void MLCurlCurl::setLevelBC (int amrlev, const MF* levelbcdata,
         for (int idim = 0; idim < 3; ++idim) {
             m_crse_sol_br[amrlev][idim]->ParallelCopy(
                 (*levelbcdata)[idim], 0, 0, 1,
-                IntVect(0), IntVect(1),
+                IntVect(0), IntVect(2),
                 m_geom[amrlev-1][0].periodicity());
         }
         m_has_cf_data[amrlev] = 1;
@@ -563,24 +563,52 @@ void MLCurlCurl::fillCoarseFineBoundary (int amrlev, MF& mf,
             MultiFab const& crse = *m_crse_sol_br[amrlev][idim];
             BoxArray crse_ba = mf[idim].boxArray();
             crse_ba.coarsen(ratio);
+            // 2 ghosts: the second-order CF-ghost interpolation reads a
+            // tangential central-difference stencil (coarse index +/-1), which
+            // for ghost edges on faces perpendicular to the tangential
+            // direction reaches 2 coarse cells beyond the coarsened patch.
             MultiFab crse_on_cfba(amrex::convert(crse_ba, m_etype[idim]),
-                                  mf[idim].DistributionMap(), 1, 1);
+                                  mf[idim].DistributionMap(), 1, 2);
             crse_on_cfba.ParallelCopy(crse, 0, 0, 1,
-                                      IntVect(1), IntVect(1));
+                                      IntVect(2), IntVect(2));
 
             auto const& sol = mf[idim].arrays();
             auto const& crsearr = crse_on_cfba.const_arrays();
             auto const& mask =
                 m_cfmask[amrlev][0][idim]->const_arrays();
             int const dir = idim;
-            ParallelFor(mf[idim], IntVect(1),
-                [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k)
-            {
-                if (mask[bno](i,j,k) != 0) {
-                    mlcurlcurl_interpset(dir, i, j, k,
-                                         sol[bno], crsearr[bno]);
-                }
-            });
+            // Second-order CF-ghost prolongation, gated to single-level
+            // (level-by-level / setCoarseFineBC) solves. There the CF data is a
+            // fixed Dirichlet BC and the higher order makes the coupling
+            // second-order accurate (verified O(dx^2) vs O(dx)). For
+            // multi-level COMPOSITE solves it is left at the original
+            // lowest-order interpset: the consistent (high-order) operator is
+            // far harder for the low-order V-cycle to precondition — under a
+            // GMRES wrap it converges 5-7x slower and stalls at small beta
+            // (the gradient near-null-space / Hiptmair problem), whereas the
+            // low-order operator keeps the existing GMRES path fast. A
+            // composite solve that is both accurate and fast needs an
+            // AMS/Hiptmair-style preconditioner (separate, research-level).
+            bool const high_order_cf = (this->m_num_amr_levels == 1);
+            if (high_order_cf) {
+                ParallelFor(mf[idim], IntVect(1),
+                    [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k)
+                {
+                    if (mask[bno](i,j,k) != 0) {
+                        mlcurlcurl_interp_cfghost(dir, i, j, k,
+                                                  sol[bno], crsearr[bno]);
+                    }
+                });
+            } else {
+                ParallelFor(mf[idim], IntVect(1),
+                    [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k)
+                {
+                    if (mask[bno](i,j,k) != 0) {
+                        mlcurlcurl_interpset(dir, i, j, k,
+                                             sol[bno], crsearr[bno]);
+                    }
+                });
+            }
         }
         Gpu::streamSynchronize();
     }
