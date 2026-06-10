@@ -212,6 +212,356 @@ MyTest::solve ()
   // diagnostic residuals see the same operator MLMG actually drives.
   mlcc.prepareForSolve();
 
+#if (AMREX_SPACEDIM == 2)
+  // ---- probe_grad=1: unit-test of the cross-level gradient channel ----
+  // Feeds an exact discrete coarse gradient field G_c(phi) through the
+  // actual cross-level coupling and measures the curl-channel leak.
+  //   Probe P: cor_f = interpolationAmr(G_c phi) with CF ghosts from the
+  //     register (interpset of G_c phi). defect = res + beta*cor_f where
+  //     res = -L(cor_f); zero iff the combined prolongation maps coarse
+  //     gradients to fine gradients (curl-conforming).
+  //   Probe A: compatible composite gradient sol_c = G_c phi,
+  //     sol_f = G_f(P_n phi). Assemble the coarse residual exactly as
+  //     MLMG does (solutionResidual(0) + reflux + avgDownResAmr);
+  //     defect = res0 + beta*sol_c (and fine-side res1 + beta*sol_f).
+  // Uniform-beta manufactured problems only; run serial for printouts.
+  {
+    int probe_grad = 0;
+    { ParmParse ppp; ppp.query("probe_grad", probe_grad); }
+    if (probe_grad && geom.size() > 1) {
+      AMREX_ALWAYS_ASSERT(!is_tube);
+      Real const bval = beta_scalar;
+      auto const hc = geom[0].CellSizeArray();
+      auto const hf = geom[1].CellSizeArray();
+
+      // phi at coarse nodes (any smooth periodic function).
+      BoxArray ndba0 = amrex::convert(grids[0], IntVect(1));
+      MultiFab phic(ndba0, dmap[0], 1, 1);
+      {
+        auto const problo = geom[0].ProbLoArray();
+        auto const& a = phic.arrays();
+        ParallelFor(phic, IntVect(1),
+            [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+        {
+          Real x = problo[0] + Real(i)*hc[0];
+          Real y = problo[1] + Real(j)*hc[1];
+          a[b](i,j,k) = std::sin(2.*M_PI*x)*std::sin(2.*M_PI*y)
+                      + Real(0.5)*std::cos(2.*M_PI*x);
+        });
+        Gpu::streamSynchronize();
+      }
+
+      // sol_c = G_c phi on coarse edges.
+      V grad_c = {MultiFab(amrex::convert(grids[0], IntVect(0,1)), dmap[0], 1, 1),
+                  MultiFab(amrex::convert(grids[0], IntVect(1,0)), dmap[0], 1, 1),
+                  MultiFab(amrex::convert(grids[0], IntVect(1,1)), dmap[0], 1, 1)};
+      {
+        auto const& pa = phic.const_arrays();
+        auto const& gx = grad_c[0].arrays();
+        auto const& gy = grad_c[1].arrays();
+        ParallelFor(grad_c[0], IntVect(0),
+            [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+        { gx[b](i,j,k) = (pa[b](i+1,j,k) - pa[b](i,j,k)) / hc[0]; });
+        ParallelFor(grad_c[1], IntVect(0),
+            [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+        { gy[b](i,j,k) = (pa[b](i,j+1,k) - pa[b](i,j,k)) / hc[1]; });
+        Gpu::streamSynchronize();
+        grad_c[2].setVal(0.0);
+        for (auto& m : grad_c) { m.FillBoundary(geom[0].periodicity()); }
+      }
+
+      // phi at fine nodes = P_n(phi_c) (parity bilinear): exactly
+      // compatible at hanging nodes.
+      BoxArray ndba1 = amrex::convert(grids[1], IntVect(1));
+      MultiFab phif(ndba1, dmap[1], 1, 1);
+      {
+        BoxArray cndba = ndba1; cndba.coarsen(2);
+        MultiFab phic_on_f(cndba, dmap[1], 1, 2);
+        phic_on_f.ParallelCopy(phic, 0, 0, 1, IntVect(1), IntVect(2),
+                               geom[0].periodicity());
+        auto const& ca = phic_on_f.const_arrays();
+        auto const& fa = phif.arrays();
+        ParallelFor(phif, IntVect(1),
+            [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+        {
+          int ic = amrex::coarsen(i,2); int jc = amrex::coarsen(j,2);
+          bool io = (2*ic != i); bool jo = (2*jc != j);
+          if (io && jo) {
+            fa[b](i,j,k) = Real(0.25)*(ca[b](ic,jc,k)+ca[b](ic+1,jc,k)
+                                      +ca[b](ic,jc+1,k)+ca[b](ic+1,jc+1,k));
+          } else if (io) {
+            fa[b](i,j,k) = Real(0.5)*(ca[b](ic,jc,k)+ca[b](ic+1,jc,k));
+          } else if (jo) {
+            fa[b](i,j,k) = Real(0.5)*(ca[b](ic,jc,k)+ca[b](ic,jc+1,k));
+          } else {
+            fa[b](i,j,k) = ca[b](ic,jc,k);
+          }
+        });
+        Gpu::streamSynchronize();
+      }
+
+      // sol_f = G_f(phi_f) on fine edges.
+      V grad_f = {MultiFab(amrex::convert(grids[1], IntVect(0,1)), dmap[1], 1, 1),
+                  MultiFab(amrex::convert(grids[1], IntVect(1,0)), dmap[1], 1, 1),
+                  MultiFab(amrex::convert(grids[1], IntVect(1,1)), dmap[1], 1, 1)};
+      {
+        auto const& pa = phif.const_arrays();
+        auto const& gx = grad_f[0].arrays();
+        auto const& gy = grad_f[1].arrays();
+        ParallelFor(grad_f[0], IntVect(0),
+            [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+        { gx[b](i,j,k) = (pa[b](i+1,j,k) - pa[b](i,j,k)) / hf[0]; });
+        ParallelFor(grad_f[1], IntVect(0),
+            [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+        { gy[b](i,j,k) = (pa[b](i,j+1,k) - pa[b](i,j,k)) / hf[1]; });
+        Gpu::streamSynchronize();
+        grad_f[2].setVal(0.0);
+        for (auto& m : grad_f) { m.FillBoundary(geom[1].periodicity()); }
+      }
+
+      auto make_zero = [&] (int lev) {
+        V z = {MultiFab(amrex::convert(grids[lev], IntVect(0,1)), dmap[lev], 1, 1),
+               MultiFab(amrex::convert(grids[lev], IntVect(1,0)), dmap[lev], 1, 1),
+               MultiFab(amrex::convert(grids[lev], IntVect(1,1)), dmap[lev], 1, 1)};
+        for (auto& m : z) { m.setVal(0.0); }
+        return z;
+      };
+
+      auto report = [&] (std::string const& name, V const& d, int lev,
+                         Real ref) {
+        for (int idim = 0; idim < 2; ++idim) {
+          Real dmax = 0.0;
+          for (MFIter mfi(d[idim]); mfi.isValid(); ++mfi) {
+            auto const& a = d[idim].const_array(mfi);
+            amrex::LoopOnCpu(mfi.validbox(), [&] (int i, int j, int k)
+            { dmax = std::max(dmax, std::abs(a(i,j,k))); });
+          }
+          amrex::Print() << "[probe] " << name << " comp=" << idim
+                         << " maxdef=" << dmax << "\n";
+          if (dmax > ref) {
+            int nprint = 0;
+            for (MFIter mfi(d[idim]); mfi.isValid(); ++mfi) {
+              auto const& a = d[idim].const_array(mfi);
+              amrex::LoopOnCpu(mfi.validbox(), [&] (int i, int j, int k)
+              {
+                if (std::abs(a(i,j,k)) > 0.3*dmax && nprint < 14) {
+                  amrex::Print() << "    (" << i << "," << j << ") lev"
+                                 << lev << " def=" << a(i,j,k) << "\n";
+                  ++nprint;
+                }
+              });
+            }
+          }
+        }
+      };
+
+      // ---- Probe C (probe_cycle=N): N fixed MLMG iterations on the real
+      // rhs, then locate the true solution-residual and solution maxima.
+      {
+        int probe_cycle = 0;
+        { ParmParse ppc; ppc.query("probe_cycle", probe_cycle); }
+        if (probe_cycle > 0) {
+          mlmg.setFixedIter(probe_cycle);
+          for (int lev = 0; lev < (int)geom.size(); ++lev) {
+            for (auto& m : solution[lev]) { m.setVal(0.0); }
+          }
+          mlmg.solve(sol_ptrs, rhs_const_ptrs, tol_rel, 0.0);
+
+          // Corner-window dump: discrete curl of sol[1] per fine cell, and
+          // the coarse-level composite mismatch (sol[0] vs avgdown sol[1]).
+          {
+            int wlo_x = -1000000, wlo_y = -1000000, whi_x, whi_y;
+            ParmParse ppw;
+            ppw.query("probe_win_lo_x", wlo_x); ppw.query("probe_win_lo_y", wlo_y);
+            whi_x = wlo_x + 8; whi_y = wlo_y + 8;
+            ppw.query("probe_win_hi_x", whi_x); ppw.query("probe_win_hi_y", whi_y);
+            if (wlo_x > -1000000) {
+              auto const hf2 = geom[1].CellSizeArray();
+              amrex::Print() << "[cwin] fine-cell curl(sol[1]) in window "
+                             << wlo_x*2 << ".." << whi_x*2 << " (fine):\n";
+              for (MFIter mfi(solution[1][0]); mfi.isValid(); ++mfi) {
+                Box const& cb = amrex::enclosedCells(mfi.validbox());
+                auto const& ex = solution[1][0].const_array(mfi);
+                auto const& ey = solution[1][1].const_array(mfi);
+                amrex::LoopOnCpu(cb, [&] (int i, int j, int k)
+                {
+                  if (i >= 2*wlo_x && i <= 2*whi_x && j >= 2*wlo_y && j <= 2*whi_y) {
+                    Real curl = (ey(i+1,j,k)-ey(i,j,k))/hf2[0]
+                              - (ex(i,j+1,k)-ex(i,j,k))/hf2[1];
+                    if (std::abs(curl) > 1.0) {
+                      amrex::Print() << "    curl(" << i << "," << j << ")="
+                                     << curl << "\n";
+                    }
+                  }
+                });
+              }
+              // coarse window: sol[0] vs avgdown(sol[1]) on x-edges/y-edges
+              for (int idim = 0; idim < 2; ++idim) {
+                BoxArray cfba = solution[1][idim].boxArray();
+                cfba.coarsen(2);
+                MultiFab cfmf(cfba, dmap[1], 1, 0);
+                average_down_edges(solution[1][idim], cfmf, IntVect(2));
+                MultiFab cmf(amrex::convert(grids[0],
+                                 idim == 0 ? IntVect(0,1) : IntVect(1,0)),
+                             dmap[0], 1, 0);
+                cmf.setVal(std::numeric_limits<Real>::quiet_NaN());
+                cmf.ParallelCopy(cfmf, 0, 0, 1);
+                amrex::Print() << "[cwin] comp=" << idim
+                               << " coarse sol[0] (and avgdown fine where cov):\n";
+                for (MFIter mfi(solution[0][idim]); mfi.isValid(); ++mfi) {
+                  auto const& a = solution[0][idim].const_array(mfi);
+                  auto const& ad = cmf.const_array(mfi);
+                  amrex::LoopOnCpu(mfi.validbox(), [&] (int i, int j, int k)
+                  {
+                    if (i >= wlo_x && i <= whi_x && j >= wlo_y && j <= whi_y) {
+                      amrex::Print() << "    (" << i << "," << j << ") sol0="
+                                     << a(i,j,k);
+                      if (!std::isnan(ad(i,j,k))) {
+                        amrex::Print() << " avgdn=" << ad(i,j,k);
+                      }
+                      amrex::Print() << "\n";
+                    }
+                  });
+                }
+              }
+            }
+          }
+
+          for (int lev = (int)geom.size()-1; lev >= 0; --lev) {
+            V resv = make_zero(lev);
+            V zb = make_zero(lev);
+            for (int idim = 0; idim < 3; ++idim) {
+              MultiFab::Copy(zb[idim], rhs[lev][idim], 0, 0, 1, IntVect(0));
+            }
+            mlcc.solutionResidual(lev, resv, solution[lev], zb,
+                                  lev > 0 ? &solution[lev-1] : nullptr);
+            report("cycle res lev" + std::to_string(lev), resv, lev, 1.0);
+            report("cycle sol lev" + std::to_string(lev),
+                   solution[lev], lev, 1.0);
+          }
+          return;
+        }
+      }
+
+      // ---- Probe D (probe_div=1): gradient-channel charge map of the
+      // first cycle's assembled coarse residual. Mimics MLMG's iter-1
+      // sequence with the production API: pre-smooth the fine level,
+      // form rescor, assemble res[0] via reflux + avgDownResAmr, then
+      // print the discrete divergence of res[0] (zero for curl-channel
+      // content; nonzero = spurious gradient-channel charge that the
+      // coarse solve amplifies by 1/beta).
+      {
+        int probe_div = 0;
+        { ParmParse ppd2; ppd2.query("probe_div", probe_div); }
+        if (probe_div) {
+          auto divmap = [&] (std::string const& name, V const& f, int lev,
+                             Real thresh) {
+            auto const h = geom[lev].CellSizeArray();
+            Real dmax = 0.0;
+            MultiFab dv(amrex::convert(grids[lev], IntVect(1,1)),
+                        dmap[lev], 1, 0);
+            dv.setVal(0.0);
+            for (MFIter mfi(dv); mfi.isValid(); ++mfi) {
+              auto const& d = dv.array(mfi);
+              auto const& fx = f[0].const_array(mfi);
+              auto const& fy = f[1].const_array(mfi);
+              Box b = mfi.validbox();
+              b.grow(-1); // skip box-boundary nodes (need neighbor data)
+              amrex::LoopOnCpu(b, [&] (int i, int j, int k)
+              {
+                d(i,j,k) = (fx(i,j,k)-fx(i-1,j,k))/h[0]
+                         + (fy(i,j,k)-fy(i,j-1,k))/h[1];
+                dmax = std::max(dmax, std::abs(d(i,j,k)));
+              });
+            }
+            amrex::Print() << "[pdiv] " << name << " max|div|=" << dmax << "\n";
+            int np = 0;
+            for (MFIter mfi(dv); mfi.isValid(); ++mfi) {
+              auto const& d = dv.const_array(mfi);
+              Box b = mfi.validbox(); b.grow(-1);
+              amrex::LoopOnCpu(b, [&] (int i, int j, int k)
+              {
+                if (std::abs(d(i,j,k)) > thresh*dmax && np < 16) {
+                  amrex::Print() << "    div(" << i << "," << j << ")="
+                                 << d(i,j,k) << "\n"; ++np;
+                }
+              });
+            }
+          };
+
+          divmap("rhs lev0 (control)", rhs[0], 0, 0.5);
+
+          // Mimic iter-1: pre-smooth fine level from zero.
+          V sol1 = make_zero(1);
+          V rhs1g = make_zero(1);
+          for (int idim = 0; idim < 3; ++idim) {
+            MultiFab::Copy(rhs1g[idim], rhs[1][idim], 0, 0, 1, IntVect(0));
+            rhs1g[idim].FillBoundary(geom[1].periodicity());
+          }
+          mlcc.smooth(1, 0, sol1, rhs1g, false, 2);
+          V rescor = make_zero(1);
+          mlcc.correctionResidual(1, 0, rescor, sol1, rhs1g,
+                                  MLCurlCurl::BCMode::Homogeneous);
+          divmap("rescor lev1 (after presmooth)", rescor, 1, 0.5);
+
+          V res0 = make_zero(0);
+          V sol0 = make_zero(0);
+          for (int idim = 0; idim < 3; ++idim) {
+            MultiFab::Copy(res0[idim], rhs[0][idim], 0, 0, 1, IntVect(0));
+          }
+          mlcc.reflux(0, res0, sol0, rhs[0], rescor, sol1, rhs1g);
+          divmap("res0 after reflux (uncov rows)", res0, 0, 0.3);
+          mlcc.avgDownResAmr(0, res0, rescor);
+          divmap("res0 assembled (reflux+avgdown)", res0, 0, 0.3);
+          return;
+        }
+      }
+
+      // ---- Probe P: correction-prolongation path ----
+      {
+        V cor_f = make_zero(1);
+        mlcc.interpolationAmr(1, cor_f, grad_c, IntVect(0));
+        V zb = make_zero(1);
+        V resf = make_zero(1);
+        mlcc.solutionResidual(1, resf, cor_f, zb, &grad_c);
+        // defect = res + beta*cor_f  (res = -L cor_f)
+        V def = make_zero(1);
+        for (int idim = 0; idim < 3; ++idim) {
+          MultiFab::LinComb(def[idim], 1.0, resf[idim], 0,
+                            bval, cor_f[idim], 0, 0, 1, IntVect(0));
+        }
+        report("P-path lev1", def, 1, 1e-11);
+      }
+
+      // ---- Probe A: composite residual assembly on compatible gradient ----
+      {
+        V res0 = make_zero(0);
+        V res1 = make_zero(1);
+        V zb0 = make_zero(0);
+        V zb1 = make_zero(1);
+        mlcc.solutionResidual(1, res1, grad_f, zb1, &grad_c);
+        V def1 = make_zero(1);
+        for (int idim = 0; idim < 3; ++idim) {
+          MultiFab::LinComb(def1[idim], 1.0, res1[idim], 0,
+                            bval, grad_f[idim], 0, 0, 1, IntVect(0));
+        }
+        report("A-path lev1 (fine rows)", def1, 1, 1e-11);
+
+        mlcc.solutionResidual(0, res0, grad_c, zb0, nullptr);
+        mlcc.reflux(0, res0, grad_c, zb0, res1, grad_f, zb1);
+        mlcc.avgDownResAmr(0, res0, res1);
+        V def0 = make_zero(0);
+        for (int idim = 0; idim < 3; ++idim) {
+          MultiFab::LinComb(def0[idim], 1.0, res0[idim], 0,
+                            bval, grad_c[idim], 0, 0, 1, IntVect(0));
+        }
+        report("A-path lev0 (assembled)", def0, 0, 1e-11);
+      }
+      return;
+    }
+  }
+#endif
+
   // Diagnostic: mimic MLMG's exact pre-iteration sequence on the user's
   // solution[] arrays in-place (after possibly being set to exact above).
   // MLMG aliases sol[alev] to user's solution[alev], so MLMG's
@@ -808,6 +1158,10 @@ MyTest::readParameters ()
   pp.query("fine_box_hi", fine_box_hi);
   pp.query("fine_box_lo_l2", fine_box_lo_l2);
   pp.query("fine_box_hi_l2", fine_box_hi_l2);
+  pp.query("fine_box2_lo_x", fine_box2_lo_x);
+  pp.query("fine_box2_lo_y", fine_box2_lo_y);
+  pp.query("fine_box2_hi_x", fine_box2_hi_x);
+  pp.query("fine_box2_hi_y", fine_box2_hi_y);
   pp.query("verbose", verbose);
   pp.query("bottom_verbose", bottom_verbose);
   pp.query("max_iter", max_iter);
@@ -933,10 +1287,22 @@ MyTest::initData ()
       int lo = (fine_box_lo >= 0) ? fine_box_lo : n_cell / 4;
       int hi = (fine_box_hi >= 0) ? fine_box_hi : (3 * n_cell / 4 - 1);
       Box fine_coarse_region{IntVect(lo), IntVect(hi)};
-      Box fine_domain = amrex::refine(fine_coarse_region, ref_ratio);
       Box fine_geom_domain = amrex::refine(domain0, ref_ratio);
       geom[1].define(fine_geom_domain);
-      grids[1].define(fine_domain);
+      // Optional second box (coarse-cell coords, inclusive, must be
+      // disjoint from box 1): produces an L/step-shaped fine region with
+      // re-entrant CF corners — the minimal jagged-CF reproducer.
+      if (fine_box2_lo_x >= 0) {
+          BoxList bl;
+          bl.push_back(amrex::refine(fine_coarse_region, ref_ratio));
+          Box box2{IntVect(AMREX_D_DECL(fine_box2_lo_x, fine_box2_lo_y, 0)),
+                   IntVect(AMREX_D_DECL(fine_box2_hi_x, fine_box2_hi_y, 0))};
+          bl.push_back(amrex::refine(box2, ref_ratio));
+          grids[1].define(bl);
+      } else {
+          Box fine_domain = amrex::refine(fine_coarse_region, ref_ratio);
+          grids[1].define(fine_domain);
+      }
       grids[1].maxSize(max_grid_size * ref_ratio);
       dmap[1].define(grids[1]);
     }

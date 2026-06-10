@@ -59,6 +59,13 @@ private:
   //! region. Only used when nlevels > 2.
   int fine_box_lo_l2 = -1;
   int fine_box_hi_l2 = -1;
+  //! Optional second level-1 box (coarse-cell coords, inclusive,
+  //! disjoint from box 1) for an L/step-shaped fine region with
+  //! re-entrant CF corners. -1 → disabled. Manufactured problem only.
+  int fine_box2_lo_x = -1;
+  int fine_box2_lo_y = -1;
+  int fine_box2_hi_x = -1;
+  int fine_box2_hi_y = -1;
   //! Max iterations passed to MLMG.
   int max_iter = 200;
   //! MLMG verbosity.

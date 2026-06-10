@@ -1785,6 +1785,288 @@ void MLCurlCurl::avgDownResAmr (int clev, MF& cres, MF const& fres) const
         // Overwrite covered region of coarse residual
         cres[idim].ParallelCopy(crse_from_fine, 0, 0, 1);
     }
+
+#if (AMREX_SPACEDIM == 2)
+    // ---- Charge projection experiment (env-gated, default off) ----
+    // The stitched composite residual (reflux rows at uncov, restricted
+    // fine residual at cov) carries O(alpha/h^2)-scale point charges
+    // (discrete-divergence sources) at CF corner nodes: the adjoint
+    // identity div_c(P^T r_f) = P_n^T(div_f r_f) holds in the interior
+    // of the covered region, but its boundary term at interface nodes is
+    // dropped by the assembly. True curl-curl residuals have only
+    // beta-scale divergence, so the coarse solve's gradient channel
+    // (eigenvalue beta) responds to these charges with a spurious smooth
+    // gradient correction of amplitude ~charge/beta. At convex-corner
+    // geometries the per-corner charges nearly cancel in pairs; at
+    // re-entrant (staircase) corners they reinforce => rho ~ delta/beta
+    // and composite divergence. Setting AMREX_MLCC_PROJECT_CHARGE=1
+    // removes the divergence content of the assembled coarse residual:
+    // solve the nodal Poisson Delta phi = div(cres) (plain CG) and
+    // subtract G phi. This also removes the (beta-scale) genuine
+    // gradient-channel residual, so it is a mechanism test, not a
+    // production fix.
+    static int const s_project_charge = [] {
+        char const* s = std::getenv("AMREX_MLCC_PROJECT_CHARGE");
+        return s ? std::atoi(s) : 0;
+    }();
+    if (s_project_charge) {
+        auto const& period = m_geom[clev][0].periodicity();
+        auto const h = m_geom[clev][0].CellSizeArray();
+        auto cdinfo = getDirichletInfo(clev, 0);
+
+        for (int idim = 0; idim < 2; ++idim) {
+            cres[idim].FillBoundary(period);
+        }
+
+        // q = div(cres) at coarse nodes.
+        BoxArray ndba = amrex::convert(m_grids[clev][0], IntVect(1));
+        MultiFab q(ndba, m_dmap[clev][0], 1, 0);
+        {
+            auto const& qa = q.arrays();
+            auto const& fx = cres[0].const_arrays();
+            auto const& fy = cres[1].const_arrays();
+            ParallelFor(q, [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+            {
+                if (cdinfo.is_dirichlet_node(i,j,k)) {
+                    qa[b](i,j,k) = Real(0.0);
+                } else {
+                    qa[b](i,j,k) = (fx[b](i,j,k)-fx[b](i-1,j,k))/h[0]
+                                 + (fy[b](i,j,k)-fy[b](i,j-1,k))/h[1];
+                }
+            });
+            Gpu::streamSynchronize();
+            amrex::OverrideSync(q, getDotMask(clev,0,2), period);
+
+            // Restrict the projection to the CF ring (default on): the
+            // spurious charge lives at interface/corner nodes; the
+            // genuine beta-scale divergence is domain-wide and must be
+            // kept so gradient errors still receive coarse correction.
+            // AMREX_MLCC_PROJECT_CHARGE=2 projects everywhere instead.
+            if (s_project_charge == 1
+                && m_fine_mask[clev][0] != nullptr)
+            {
+                // Ghosted copies of the edge fine-masks so ring detection
+                // works across box boundaries (fine_mask itself has 0
+                // ghosts). Out-of-domain ghosts default to 1 (uncovered).
+                iMultiFab xm(m_fine_mask[clev][0]->boxArray(),
+                             m_dmap[clev][0], 1, 1);
+                iMultiFab ym(m_fine_mask[clev][1]->boxArray(),
+                             m_dmap[clev][0], 1, 1);
+                xm.setVal(1); ym.setVal(1);
+                iMultiFab::Copy(xm, *m_fine_mask[clev][0], 0, 0, 1, 0);
+                iMultiFab::Copy(ym, *m_fine_mask[clev][1], 0, 0, 1, 0);
+                xm.FillBoundary(period);
+                ym.FillBoundary(period);
+
+                iMultiFab ring(ndba, m_dmap[clev][0], 1, 1);
+                ring.setVal(0);
+                auto const& ra = ring.arrays();
+                auto const& mx = xm.const_arrays();
+                auto const& my = ym.const_arrays();
+                ParallelFor(ring,
+                    [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+                {
+                    auto const& ax = mx[b];
+                    auto const& ay = my[b];
+                    int ncov = 0, nunc = 0;
+                    (ax(i-1,j,k)==0 ? ncov : nunc) += 1;
+                    (ax(i  ,j,k)==0 ? ncov : nunc) += 1;
+                    (ay(i,j-1,k)==0 ? ncov : nunc) += 1;
+                    (ay(i,j  ,k)==0 ? ncov : nunc) += 1;
+                    ra[b](i,j,k) = (ncov > 0 && nunc > 0) ? 1 : 0;
+                });
+                Gpu::streamSynchronize();
+                ring.FillBoundary(period);
+                // grow the ring by one node
+                iMultiFab ring2(ndba, m_dmap[clev][0], 1, 0);
+                auto const& r2a = ring2.arrays();
+                auto const& r1a = ring.const_arrays();
+                ParallelFor(ring2,
+                    [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+                {
+                    int s = 0;
+                    for (int dj = -1; dj <= 1; ++dj) {
+                    for (int di = -1; di <= 1; ++di) {
+                        s += r1a[b](i+di,j+dj,k);
+                    }}
+                    r2a[b](i,j,k) = (s > 0) ? 1 : 0;
+                });
+                Gpu::streamSynchronize();
+                auto const& qa2 = q.arrays();
+                auto const& rfin = ring2.const_arrays();
+                ParallelFor(q,
+                    [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+                {
+                    if (rfin[b](i,j,k) == 0) { qa2[b](i,j,k) = Real(0.0); }
+                });
+                Gpu::streamSynchronize();
+            }
+        }
+        bool const is_periodic = m_geom[clev][0].isAllPeriodic();
+        if (is_periodic) {
+            // remove mean for solvability (use owner mask to count each
+            // node once)
+            auto const& dmsk = getDotMask(clev,0,2);
+            Real qsum, nsum;
+            {
+                auto const& qa = q.const_arrays();
+                auto const& ma = dmsk.const_arrays();
+                GpuTuple<Real,Real> t = ParReduce(
+                    TypeList<ReduceOpSum,ReduceOpSum>{},
+                    TypeList<Real,Real>{}, q, IntVect(0),
+                    [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+                        -> GpuTuple<Real,Real>
+                {
+                    return { qa[b](i,j,k) * Real(ma[b](i,j,k)),
+                             Real(ma[b](i,j,k)) };
+                });
+                qsum = amrex::get<0>(t);
+                nsum = amrex::get<1>(t);
+                Real both[2] = {qsum, nsum};
+                ParallelAllReduce::Sum(both, 2,
+                    ParallelContext::CommunicatorSub());
+                qsum = both[0]; nsum = both[1];
+            }
+            q.plus(-qsum/nsum, 0, 1, 0);
+        }
+
+        // PCG on the beta-weighted 5-point nodal Laplacian:
+        // A phi = q, A = -div(beta grad), SPD. The subtracted field
+        // beta*G(phi) is then exactly in the operator's gradient-channel
+        // range (L(G phi) = beta o G phi), so the coarse solve's 1/beta
+        // response to the charge is cancelled even for variable beta.
+        // Dirichlet (phi=0) at domain boundary nodes for non-periodic.
+        bool const cg_has_beta = (m_bcoefs[clev][0][0] != nullptr);
+        Real const cg_bscalar = m_beta;
+        MultiArray4<Real const> cg_bx, cg_by;
+        if (cg_has_beta) {
+            cg_bx = m_bcoefs[clev][0][0]->const_arrays();
+            cg_by = m_bcoefs[clev][0][1]->const_arrays();
+        }
+        MultiFab phi(ndba, m_dmap[clev][0], 1, 1);
+        MultiFab rr (ndba, m_dmap[clev][0], 1, 0);
+        MultiFab pp (ndba, m_dmap[clev][0], 1, 1);
+        MultiFab Ap (ndba, m_dmap[clev][0], 1, 0);
+        MultiFab zz (ndba, m_dmap[clev][0], 1, 0);
+        phi.setVal(0.0); pp.setVal(0.0);
+        MultiFab::Copy(rr, q, 0, 0, 1, 0);
+        auto const& dm = getDotMask(clev,0,2);
+        auto precond = [&] (MultiFab& z, MultiFab const& r) {
+            auto const& za = z.arrays();
+            auto const& ra2 = r.const_arrays();
+            auto const& bxa = cg_bx;
+            auto const& bya = cg_by;
+            bool const hb = cg_has_beta;
+            Real const bs = cg_bscalar;
+            ParallelFor(z, [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+            {
+                Real bxm = hb ? bxa[b](i-1,j,k) : bs;
+                Real bxp = hb ? bxa[b](i  ,j,k) : bs;
+                Real bym = hb ? bya[b](i,j-1,k) : bs;
+                Real byp = hb ? bya[b](i,j  ,k) : bs;
+                Real diag = (bxm+bxp)/(h[0]*h[0]) + (bym+byp)/(h[1]*h[1]);
+                za[b](i,j,k) = ra2[b](i,j,k) / std::max(diag, Real(1e-300));
+            });
+            Gpu::streamSynchronize();
+        };
+        precond(zz, rr);
+        MultiFab::Copy(pp, zz, 0, 0, 1, 0);
+        auto mdot = [&] (MultiFab const& a, MultiFab const& b2) -> Real {
+            auto const& aa = a.const_arrays();
+            auto const& ba = b2.const_arrays();
+            auto const& ma = dm.const_arrays();
+            GpuTuple<Real> t = ParReduce(TypeList<ReduceOpSum>{},
+                                         TypeList<Real>{}, a, IntVect(0),
+                [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+                    -> GpuTuple<Real>
+            {
+                return { aa[b](i,j,k)*ba[b](i,j,k)*Real(ma[b](i,j,k)) };
+            });
+            Real s = amrex::get<0>(t);
+            ParallelAllReduce::Sum(s, ParallelContext::CommunicatorSub());
+            return s;
+        };
+        Real rz = mdot(rr, zz);
+        Real const rr0 = mdot(rr, rr);
+        int const maxcg = 600;
+        for (int it = 0; it < maxcg; ++it) {
+            if (mdot(rr, rr) <= Real(1e-24)*rr0) { break; }
+            amrex::OverrideSync(pp, dm, period);
+            pp.FillBoundary(period);
+            {
+                auto const& apa = Ap.arrays();
+                auto const& pa = pp.const_arrays();
+                auto const& bxa = cg_bx;
+                auto const& bya = cg_by;
+                bool const hb = cg_has_beta;
+                Real const bs = cg_bscalar;
+                ParallelFor(Ap,
+                    [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+                {
+                    if (cdinfo.is_dirichlet_node(i,j,k)) {
+                        apa[b](i,j,k) = pa[b](i,j,k);
+                    } else {
+                        Real bxm = hb ? bxa[b](i-1,j,k) : bs;
+                        Real bxp = hb ? bxa[b](i  ,j,k) : bs;
+                        Real bym = hb ? bya[b](i,j-1,k) : bs;
+                        Real byp = hb ? bya[b](i,j  ,k) : bs;
+                        apa[b](i,j,k) =
+                            -((bxp*(pa[b](i+1,j,k)-pa[b](i,j,k))
+                              -bxm*(pa[b](i,j,k)-pa[b](i-1,j,k)))/(h[0]*h[0])
+                            + (byp*(pa[b](i,j+1,k)-pa[b](i,j,k))
+                              -bym*(pa[b](i,j,k)-pa[b](i,j-1,k)))/(h[1]*h[1]));
+                    }
+                });
+                Gpu::streamSynchronize();
+            }
+            Real pAp = mdot(pp, Ap);
+            if (pAp <= Real(0.0)) { break; }
+            Real alpha_cg = rz/pAp;
+            MultiFab::Saxpy(phi, alpha_cg, pp, 0, 0, 1, 0);
+            MultiFab::Saxpy(rr, -alpha_cg, Ap, 0, 0, 1, 0);
+            precond(zz, rr);
+            Real rznew = mdot(rr, zz);
+            Real beta_cg = rznew/rz;
+            rz = rznew;
+            MultiFab::LinComb(pp, Real(1.0), zz, 0, beta_cg, pp, 0, 0, 1,
+                              IntVect(0));
+        }
+        amrex::OverrideSync(phi, dm, period);
+        phi.FillBoundary(period);
+
+        // Subtract the operator-range gradient field carrying the charge:
+        // div(beta G phi) = -A phi = -q, so cres += beta o G(phi) makes
+        // div(cres_new) = q - q = 0, and the removed field beta o G(phi)
+        // is exactly L(G phi) — the component the coarse gradient
+        // channel would have amplified by 1/beta.
+        {
+            auto const& fx = cres[0].arrays();
+            auto const& pa = phi.const_arrays();
+            auto const& bxa = cg_bx;
+            bool const hb = cg_has_beta;
+            Real const bs = cg_bscalar;
+            ParallelFor(cres[0],
+                [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+            {
+                if (!cdinfo.is_dirichlet_x_edge(i,j,k)) {
+                    Real bb = hb ? bxa[b](i,j,k) : bs;
+                    fx[b](i,j,k) += bb*(pa[b](i+1,j,k)-pa[b](i,j,k))/h[0];
+                }
+            });
+            auto const& fy = cres[1].arrays();
+            auto const& bya = cg_by;
+            ParallelFor(cres[1],
+                [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+            {
+                if (!cdinfo.is_dirichlet_y_edge(i,j,k)) {
+                    Real bb = hb ? bya[b](i,j,k) : bs;
+                    fy[b](i,j,k) += bb*(pa[b](i,j+1,k)-pa[b](i,j,k))/h[1];
+                }
+            });
+            Gpu::streamSynchronize();
+        }
+    }
+#endif
 }
 
 // ========================================================================
