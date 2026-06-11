@@ -110,6 +110,13 @@ public:
 
     [[nodiscard]] RT normInf (int amrlev, MF const& mf, bool local) const override;
 
+    //! The outer Krylov matrix action sees the second-order CF-ghost
+    //! solution path (accurate composite operator); the preconditioner's
+    //! internal cycle keeps the lowest-order curl-conforming fill it is
+    //! built around. See apply().
+    void beginMatrixApply () override { m_matrix_apply = true; }
+    void endMatrixApply () override { m_matrix_apply = false; }
+
     //! Multi-AMR-level dot product for GMRESMLMG. Sums xdoty over all
     //! AMR levels (each xdoty excludes covered coarse edges via the
     //! AMR fine_mask), then reduces across MPI ranks.
@@ -181,17 +188,30 @@ private:
     //! Fill ghost cells: FillBoundary + physical BC + CF BC.
     //! When homogeneous is true, CF ghosts are filled with zero
     //! (correction equation). When false, they are filled from stored
-    //! coarse data (solution equation).
+    //! coarse data (solution equation). sol2nd selects the second-order
+    //! CF-ghost prolongation (solution path of multi-level composite
+    //! solves; the correction path keeps the lowest-order curl-
+    //! conforming interpolation).
     void applyBC (int amrlev, int mglev, MF& in, CurlCurlStateType type,
-                  bool homogeneous = false) const;
+                  bool homogeneous = false, bool sol2nd = false) const;
 
     //! Fill CF ghost cells using m_cfmask to avoid corrupting same-level
     //! neighbor ghosts. When homogeneous is true, writes zero. When false,
-    //! interpolates from m_crse_sol_br.
-    void fillCoarseFineBoundary (int amrlev, MF& mf, bool homogeneous) const;
+    //! interpolates from m_crse_sol_br (second order when sol2nd).
+    void fillCoarseFineBoundary (int amrlev, MF& mf, bool homogeneous,
+                                 bool sol2nd = false) const;
 
     //! Build CF masks for all AMR/MG levels.
     void buildCFMasks ();
+
+    //! Solve the beta-weighted nodal Poisson -div(beta grad phi) = q on
+    //! level clev (diagonal-preconditioned CG) and add beta o grad(phi)
+    //! to cres, removing the charge q from div(cres). If ring_only, q is
+    //! first restricted to the CF interface ring (+1 node). Used by the
+    //! charge-consistent composite assembly and by the diagnostic charge
+    //! projection in avgDownResAmr.
+    void hodgeNeutralizeCharge (int clev, MF& cres, MultiFab& q,
+                                bool ring_only) const;
 
     //! Build fine coverage masks for all AMR levels except the finest.
     void buildFineMask ();
@@ -247,6 +267,19 @@ private:
     //! Fine coverage mask: 0=covered by finer level, 1=not covered.
     //! [amrlev][idim]. Only for amrlev < finest.
     mutable Vector<Array<std::unique_ptr<iMultiFab>,3>> m_fine_mask;
+
+    //! Stash of the alpha*curl(curl) components of the fields entering
+    //! the composite residual assembly, per coarse AMR level: filled by
+    //! reflux, consumed by avgDownResAmr for the charge-consistent
+    //! assembly correction (see avgDownResAmr). [crse_amrlev][idim].
+    mutable Vector<Array<MultiFab,3>> m_kstash_crse;
+    mutable Vector<Array<MultiFab,3>> m_kstash_fine;
+    mutable Vector<int> m_kstash_valid;
+
+    //! True while the outer Krylov matrix action is being applied
+    //! (begin/endMatrixApply); selects the second-order CF-ghost
+    //! solution path in apply().
+    bool m_matrix_apply = false;
 };
 
 }

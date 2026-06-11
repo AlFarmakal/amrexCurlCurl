@@ -1317,6 +1317,128 @@ void mlcurlcurl_restriction (int dir, int i, int j, int k,
 }
 
 /**
+ * \brief Charge-consistent residual restriction for the cross-AMR-level
+ * composite assembly (avgDownResAmr).
+ *
+ * The full-weighting kernel mlcurlcurl_restriction is the right adjoint
+ * pair of mlcurlcurl_interpadd for within-level MG, and in the interior
+ * of the covered region it satisfies the exact adjoint identity
+ * div_c(P^T r) = P_n^T(div_f r), so the charge (discrete divergence) of
+ * the restricted residual is physical. But at covered coarse edges whose
+ * stencil reaches outside the fine valid region (the CF ring; at
+ * re-entrant corners, several edges at once), the zero-extension of the
+ * fine residual manufactures O(|r|/h) spurious surface charges at
+ * interface nodes — even when restricting a smooth compatible field
+ * such as the rhs. True curl-curl residuals carry only beta-scale
+ * divergence, so the coarse solve's gradient channel (eigenvalue beta)
+ * amplifies these charges by 1/beta into a misdirected smooth
+ * correction: rho ~ delta(geometry)/beta, i.e. composite divergence on
+ * jagged CF (see CURLCURL_AMR_CONTRACTION_ROOT_CAUSE.md).
+ *
+ * This kernel restores the dropped boundary term: where the
+ * full-weighting stencil would read a true CF-ghost edge (cfm == 1,
+ * i.e. a zero-extension site), it deposits the *trace* restriction
+ * instead — the plain average over the colinear fine children (the
+ * same average_down_edges / average_down_nodal convention used for
+ * solutions, rhs, and composite_sol throughout the composite
+ * bookkeeping). The trace reproduces trace-compatible fields exactly at
+ * the seam, so the stitched coarse residual is charge-free there, and
+ * it commutes with the discrete gradient via nodal injection, so the
+ * genuine beta-scale gradient-channel signal is preserved. Away from
+ * the seam the full-weighting kernel is used unchanged.
+ */
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+void mlcurlcurl_restriction_cc (int dir, int i, int j, int k,
+                                Array4<Real> const& crse,
+                                Array4<Real const> const& fine,
+                                CurlCurlDirichletInfo const& dinfo,
+                                Array4<int const> const& cfm)
+{
+    int const ii = i*2;
+    int const jj = j*2;
+    int const kk = k*2;
+    if (dinfo.is_dirichlet_edge(dir,ii,jj,kk)) {
+        crse(i,j,k) = Real(0.0);
+        return;
+    }
+#if (AMREX_SPACEDIM == 3)
+    if (dir == 0) {
+        bool const clean =
+            cfm(ii  ,jj-1,kk-1)==0 && cfm(ii  ,jj  ,kk-1)==0 && cfm(ii  ,jj+1,kk-1)==0 &&
+            cfm(ii  ,jj-1,kk  )==0 &&                           cfm(ii  ,jj+1,kk  )==0 &&
+            cfm(ii  ,jj-1,kk+1)==0 && cfm(ii  ,jj  ,kk+1)==0 && cfm(ii  ,jj+1,kk+1)==0 &&
+            cfm(ii+1,jj-1,kk-1)==0 && cfm(ii+1,jj  ,kk-1)==0 && cfm(ii+1,jj+1,kk-1)==0 &&
+            cfm(ii+1,jj-1,kk  )==0 &&                           cfm(ii+1,jj+1,kk  )==0 &&
+            cfm(ii+1,jj-1,kk+1)==0 && cfm(ii+1,jj  ,kk+1)==0 && cfm(ii+1,jj+1,kk+1)==0;
+        if (!clean) {
+            crse(i,j,k) = Real(0.5)*(fine(ii,jj,kk)+fine(ii+1,jj,kk));
+            return;
+        }
+    } else if (dir == 1) {
+        bool const clean =
+            cfm(ii-1,jj  ,kk-1)==0 && cfm(ii  ,jj  ,kk-1)==0 && cfm(ii+1,jj  ,kk-1)==0 &&
+            cfm(ii-1,jj  ,kk  )==0 &&                           cfm(ii+1,jj  ,kk  )==0 &&
+            cfm(ii-1,jj  ,kk+1)==0 && cfm(ii  ,jj  ,kk+1)==0 && cfm(ii+1,jj  ,kk+1)==0 &&
+            cfm(ii-1,jj+1,kk-1)==0 && cfm(ii  ,jj+1,kk-1)==0 && cfm(ii+1,jj+1,kk-1)==0 &&
+            cfm(ii-1,jj+1,kk  )==0 &&                           cfm(ii+1,jj+1,kk  )==0 &&
+            cfm(ii-1,jj+1,kk+1)==0 && cfm(ii  ,jj+1,kk+1)==0 && cfm(ii+1,jj+1,kk+1)==0;
+        if (!clean) {
+            crse(i,j,k) = Real(0.5)*(fine(ii,jj,kk)+fine(ii,jj+1,kk));
+            return;
+        }
+    } else {
+        bool const clean =
+            cfm(ii-1,jj-1,kk  )==0 && cfm(ii  ,jj-1,kk  )==0 && cfm(ii+1,jj-1,kk  )==0 &&
+            cfm(ii-1,jj  ,kk  )==0 &&                           cfm(ii+1,jj  ,kk  )==0 &&
+            cfm(ii-1,jj+1,kk  )==0 && cfm(ii  ,jj+1,kk  )==0 && cfm(ii+1,jj+1,kk  )==0 &&
+            cfm(ii-1,jj-1,kk+1)==0 && cfm(ii  ,jj-1,kk+1)==0 && cfm(ii+1,jj-1,kk+1)==0 &&
+            cfm(ii-1,jj  ,kk+1)==0 &&                           cfm(ii+1,jj  ,kk+1)==0 &&
+            cfm(ii-1,jj+1,kk+1)==0 && cfm(ii  ,jj+1,kk+1)==0 && cfm(ii+1,jj+1,kk+1)==0;
+        if (!clean) {
+            crse(i,j,k) = Real(0.5)*(fine(ii,jj,kk)+fine(ii,jj,kk+1));
+            return;
+        }
+    }
+#elif (AMREX_SPACEDIM == 2)
+    if (dir == 0) {
+        bool const clean =
+            cfm(ii  ,jj-1,0)==0 && cfm(ii  ,jj+1,0)==0 &&
+            cfm(ii+1,jj-1,0)==0 && cfm(ii+1,jj+1,0)==0;
+        if (!clean) {
+            crse(i,j,0) = Real(0.5)*(fine(ii,jj,0)+fine(ii+1,jj,0));
+            return;
+        }
+    } else if (dir == 1) {
+        bool const clean =
+            cfm(ii-1,jj  ,0)==0 && cfm(ii+1,jj  ,0)==0 &&
+            cfm(ii-1,jj+1,0)==0 && cfm(ii+1,jj+1,0)==0;
+        if (!clean) {
+            crse(i,j,0) = Real(0.5)*(fine(ii,jj,0)+fine(ii,jj+1,0));
+            return;
+        }
+    } else {
+        bool const clean =
+            cfm(ii-1,jj-1,0)==0 && cfm(ii  ,jj-1,0)==0 && cfm(ii+1,jj-1,0)==0 &&
+            cfm(ii-1,jj  ,0)==0 &&                        cfm(ii+1,jj  ,0)==0 &&
+            cfm(ii-1,jj+1,0)==0 && cfm(ii  ,jj+1,0)==0 && cfm(ii+1,jj+1,0)==0;
+        if (!clean) {
+            crse(i,j,0) = fine(ii,jj,0); // coincident-node injection
+            return;
+        }
+    }
+#else
+    if (dir != 0) {
+        bool const clean = cfm(ii-1,0,0)==0 && cfm(ii+1,0,0)==0;
+        if (!clean) {
+            crse(i,0,0) = fine(ii,0,0);
+            return;
+        }
+    }
+#endif
+    mlcurlcurl_restriction(dir, i, j, k, crse, fine, dinfo);
+}
+
+/**
  * \brief Interpolate coarse edge data to fine edge — set (not add).
  *
  * Same interpolation logic as mlcurlcurl_interpadd but assigns (=)

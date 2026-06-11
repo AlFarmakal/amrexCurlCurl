@@ -180,3 +180,133 @@ mpiexec -n 1 ./main2d.gnu.MPI.ex inputs.shifted_amr beta_scalar=1.0 probe_grad=1
 AMREX_MLCC_PROJECT_CHARGE=1 mpiexec -n 4 ./main2d.gnu.MPI.ex inputs.tube_diffusion_tight  composite=1 plot_dir=/tmp/t
 AMREX_MLCC_PROJECT_CHARGE=1 mpiexec -n 4 ./main2d.gnu.MPI.ex inputs.tube_diffusion_loose tube_eta_FS=1.0e6 composite=1 plot_dir=/tmp/b
 ```
+
+---
+
+# Part 2: the charge-consistent assembly (implementation + results)
+
+Follow-up session: implement the production fix specified above and
+test it. Outcome: **every previously-divergent composite case now
+converges under the Krylov mode (`composite=2`), including to the
+second-order-accurate answer**; the pure stationary cycle
+(`composite=1`) is bounded everywhere with a small documented residual
+floor on jagged CF, and its remaining blocker is precisely
+characterized (pocket-ghost coupling asymmetry, see below).
+
+## What was implemented
+
+1. **Charge-consistent assembly** (`AMREX_MLCC_KCHARGE`, default on).
+   Phase 1 (`reflux`): stash the reference field
+   `rhs_c − β∘composite_sol`, whose discrete divergence equals the true
+   composite residual's charge exactly (the α curl(curl) part
+   telescopes to zero identically, for any coefficients). Phase 2
+   (`avgDownResAmr`): correct the assembled residual's charge to that
+   target via a ring-restricted β-weighted Hodge subtraction
+   (`hodgeNeutralizeCharge`, diagonal-preconditioned CG on the
+   β-weighted nodal Laplacian). Verified: the corrected assembly's
+   leftover charge scales exactly ∝ β (15698 → 6.5 at β=1 → 0.0064 at
+   β=1e-3 on the L corner).
+
+2. **Second-order solution path under Krylov**
+   (`AMREX_MLCC_SOL2ND`, default 2): Solution-mode applies inside the
+   GMRES context (matrix action AND the preconditioner's residuals —
+   gated by `beginMatrixApply`/`m_precond_mode`) use the second-order
+   CF ghosts, so GMRES converges to the second-order-accurate composite
+   fixed point with a *matched* preconditioner. Matched preconditioning
+   is decisively better than preconditioning the accurate system with
+   the first-order cycle (tube tight: 167 it vs stall at 2.7e-6). The
+   stationary cycle and all Correction-mode applies keep the
+   lowest-order curl-conforming fill. New hook:
+   `MLLinOpT::begin/endMatrixApply`, fired by `GMRESMLMGT::apply`.
+
+3. `gmres_precond_iters` default raised to 4 in the test driver (the
+   accurate system's corner near-null modes need the stronger
+   preconditioner; 1 suffices for `AMREX_MLCC_SOL2ND=0`).
+
+## Results (tol_rel: tube 1e-7, manufactured 1e-10)
+
+| case | baseline composite | now: `composite=2` (GMRES) | now: `composite=1` (stationary) |
+|---|---|---|---|
+| tube tight | diverges 390×/it | **167 it → 4.5e-8** (accurate op) / 48 it (1st-order op) | bounded, floor 4.7e-5 |
+| tube loose_annular | diverges | **162 it → 9.5e-8** | bounded, floor 1.4e-5 |
+| tube loose | 17 it (wrong-ish corners) | 310 it @p1 | **14 it ✓** |
+| tube loose, β_FS=1e-6 | diverges | **74 it ✓** (1st-order op; accurate op stalls: Hiptmair-gap regime) | **14 it ✓** |
+| manufactured shifted | 42 it, **err 47** | **100 it → 8.7e-11, err 0.499** | stalls 0.13 (floor) |
+| manufactured L (1 re-entrant corner) | diverges from iter 1 at ANY β | **173 it → 4.3e-11** (β=1e-3) | bounded, floor ∝1/β |
+| trivial_amr | 7 it | 4 it, err 1.2e-3 | 7 it ✓ |
+| LBL (`composite=0`) | — | — | unchanged (15 it) ✓ |
+
+Iteration-count note: the first-order system converges in 27–74 outer
+iterations (p=1); the second-order-accurate system currently needs
+~100–170 with p=4. Reaching ~30–40 on the accurate system requires an
+auxiliary-space (AMS-style) gradient-channel correction in the
+preconditioner — the β-weighted nodal solver this branch already
+contains is exactly the needed building block.
+
+## The remaining stationary (`composite=1`) blocker, exactly
+
+Residual-side corrections cannot push the stationary floors to zero —
+there is a structural no-go: a correction that vanishes at the fixed
+point reproduces the variational charge, which at re-entrant corners IS
+the garbage (it is the boundary term of the *asymmetric* composite
+operator). The asymmetry was localized exactly with two new probes:
+
+* `probe_asym` (impulse columns of the assembled operator's charge
+  map): flat-face and convex-corner interface rows deposit clean
+  parent-edge charge dipoles that telescope along each face; at a
+  re-entrant pocket, exactly four rows misroute dipole endpoints
+  across the two faces.
+* `probe_w` (row-to-charge map of the restriction alone): perfectly
+  regular even at the corner — the misrouting is in the OPERATOR's
+  couplings, not the deposit weights.
+* Hand-derivation through the mixed pocket ghosts (the ghost edges
+  whose interpset stencil reads 0.5·slave + 0.5·uncov) shows: the x–x
+  couplings and all flat-face pairings are exactly weighted-symmetric
+  (ratio 1/4 = the FD measure), but the **dxy cross-couplings at the
+  pocket have a sign clash**: A(x2→y1) = −a·dxy/2 vs A(y1→x2) =
+  +a·dxy/2 through the corresponding ghosts. Weighted symmetry forces
+  the slave weight a → 0, but consistency (Σw = 1) then overshoots the
+  fine↔uncov coupling by exactly 2×: pure ghost-weight tuning is
+  over-determined. A solution exists in the larger design space
+  (linear-extrapolation-type pocket fills with signed weights, plus
+  matched reflux-row compensation with diagonal rebalancing) — a small
+  solvable linear system over ~10 coefficients per corner orientation.
+  That derivation + corner-aware kernels is the remaining work for
+  full stationary convergence; the impulse probes above are the
+  verification harness for it.
+
+## Tried and refuted in this session
+
+* Trace-ring deposits (`mlcurlcurl_restriction_cc`, kept as
+  `AMREX_MLCC_CC_ASSEMBLY=1` diagnostic): reshapes the corner charge
+  into a near-dipole but does not remove it.
+* K-only split (residual's curl-part stitch): misses the rhs-stitch
+  charge, which dominates at iteration 1.
+* Clip-envelope (subtract only charge exceeding c·|target|): the
+  envelope inherits the target's corner bias; sub-envelope garbage
+  re-ignites divergence.
+* sol2nd on the stationary solution path: does not lower the tube
+  floors and regresses manufactured cases (the (P2nd−P1st)(cor) ring
+  jolt) — hence the m_precond_mode gating.
+* Direct dipole re-routing linear in corner-row residuals: wrong frame
+  (the impulse columns are solution-linear, not residual-linear).
+
+## Reproduce
+
+```bash
+cd Tests/LinearSolvers/CurlCurl_AMR && make -j
+
+# converged + accurate composite (the headline):
+mpiexec -n 4 ./main2d.gnu.MPI.ex inputs.tube_diffusion_tight composite=2 plot_dir=/tmp/t
+mpiexec -n 4 ./main2d.gnu.MPI.ex inputs.shifted_amr composite=2 plot_dir=/tmp/s   # err 0.5, not 47
+
+# fast first-order composite:
+AMREX_MLCC_SOL2ND=0 mpiexec -n 4 ./main2d.gnu.MPI.ex inputs.tube_diffusion_tight composite=2 gmres_precond_iters=1 plot_dir=/tmp/t1
+
+# stationary cycle: bounded with floor (no more divergence):
+mpiexec -n 4 ./main2d.gnu.MPI.ex inputs.tube_diffusion_tight composite=1 plot_dir=/tmp/t2
+
+# asymmetry probes (serial):
+AMREX_MLCC_KCHARGE=0 mpiexec -n 1 ./main2d.gnu.MPI.ex inputs.shifted_amr beta_scalar=1.0 \
+  probe_grad=1 probe_asym=1 fine_box2_lo_x=40 fine_box2_lo_y=8 fine_box2_hi_x=55 fine_box2_hi_y=23 plot_dir=/tmp/a
+```

@@ -61,6 +61,9 @@ void MLCurlCurl::define (const Vector<Geometry>& a_geom,
     m_crse_sol_br.resize(this->m_num_amr_levels);
     m_has_cf_data.resize(this->m_num_amr_levels, 0);
     m_fine_mask.resize(this->m_num_amr_levels);
+    m_kstash_crse.resize(this->m_num_amr_levels);
+    m_kstash_fine.resize(this->m_num_amr_levels);
+    m_kstash_valid.resize(this->m_num_amr_levels, 0);
 }
 
 void MLCurlCurl::setScalars (RT a_alpha, RT a_beta) noexcept
@@ -513,7 +516,8 @@ void MLCurlCurl::buildCFMasks ()
 // ========================================================================
 
 void MLCurlCurl::fillCoarseFineBoundary (int amrlev, MF& mf,
-                                          bool homogeneous) const
+                                          bool homogeneous,
+                                          bool sol2nd) const
 {
     if (m_cfmask[amrlev][0][0] == nullptr) { return; }
 
@@ -577,19 +581,19 @@ void MLCurlCurl::fillCoarseFineBoundary (int amrlev, MF& mf,
             auto const& mask =
                 m_cfmask[amrlev][0][idim]->const_arrays();
             int const dir = idim;
-            // Second-order CF-ghost prolongation, gated to single-level
-            // (level-by-level / setCoarseFineBC) solves. There the CF data is a
-            // fixed Dirichlet BC and the higher order makes the coupling
-            // second-order accurate (verified O(dx^2) vs O(dx)). For
-            // multi-level COMPOSITE solves it is left at the original
-            // lowest-order interpset: the consistent (high-order) operator is
-            // far harder for the low-order V-cycle to precondition — under a
-            // GMRES wrap it converges 5-7x slower and stalls at small beta
-            // (the gradient near-null-space / Hiptmair problem), whereas the
-            // low-order operator keeps the existing GMRES path fast. A
-            // composite solve that is both accurate and fast needs an
-            // AMS/Hiptmair-style preconditioner (separate, research-level).
-            bool const high_order_cf = (this->m_num_amr_levels == 1);
+            // Second-order CF-ghost prolongation. Always used for
+            // single-level (level-by-level / setCoarseFineBC) solves,
+            // where the CF data is a fixed Dirichlet BC and the higher
+            // order makes the coupling second-order accurate (verified
+            // O(dx^2) vs O(dx)). For multi-level COMPOSITE solves it is
+            // used on the SOLUTION path only (sol2nd, from
+            // StateMode::Solution in apply): that path defines the
+            // composite operator and hence the fixed point's accuracy,
+            // while the correction path (StateMode::Correction /
+            // homogeneous) keeps the lowest-order curl-conforming
+            // interpset that the cycle's transfers are built around.
+            bool const high_order_cf = (this->m_num_amr_levels == 1)
+                                       || sol2nd;
             if (high_order_cf) {
                 ParallelFor(mf[idim], IntVect(1),
                     [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k)
@@ -619,7 +623,8 @@ void MLCurlCurl::fillCoarseFineBoundary (int amrlev, MF& mf,
 // ========================================================================
 
 void MLCurlCurl::applyBC (int amrlev, int mglev, MF& in,
-                           CurlCurlStateType type, bool homogeneous) const
+                           CurlCurlStateType type, bool homogeneous,
+                           bool sol2nd) const
 {
     int nmfs = 3;
 #if (AMREX_SPACEDIM == 2)
@@ -644,11 +649,11 @@ void MLCurlCurl::applyBC (int amrlev, int mglev, MF& in,
         && ((amrlev > 0) ||
             (amrlev == 0 && this->needsCoarseDataForBC()));
     if (cf_fill) {
-        fillCoarseFineBoundary(amrlev, in, homogeneous);
+        fillCoarseFineBoundary(amrlev, in, homogeneous, sol2nd);
     }
 #else
     if (amrlev > 0 && mglev == 0 && type != CurlCurlStateType::b) {
-        fillCoarseFineBoundary(amrlev, in, homogeneous);
+        fillCoarseFineBoundary(amrlev, in, homogeneous, sol2nd);
     }
 #endif
 
@@ -1017,10 +1022,31 @@ void MLCurlCurl::interpolationAmr (int famrlev, MF& fine, const MF& crse,
 
 void
 MLCurlCurl::apply (int amrlev, int mglev, MF& out, MF& in, BCMode bc_mode,
-                   StateMode /*s_mode*/, const MLMGBndryT<MF>* /*bndry*/) const
+                   StateMode s_mode, const MLMGBndryT<MF>* /*bndry*/) const
 {
     bool const homogeneous = (bc_mode == BCMode::Homogeneous);
-    applyBC(amrlev, mglev, in, CurlCurlStateType::x, homogeneous);
+    // For multi-level composite solves under an outer Krylov method,
+    // Solution-mode applies use the second-order CF-ghost prolongation:
+    // GMRES then converges to the second-order-accurate composite fixed
+    // point, and the preconditioner's residuals see the same (matched)
+    // operator — empirically far better than preconditioning the
+    // accurate system with the first-order cycle. Correction-mode
+    // applies always keep the lowest-order curl-conforming fill the
+    // cycle's transfers are built around. The plain stationary solve
+    // (composite=1; m_precond_mode unset) also keeps the first-order
+    // operator: dropping the second-order fill into the stationary
+    // cycle destroys contraction (CURLCURL_AMR_CONTRACTION_ROOT_CAUSE).
+    // AMREX_MLCC_SOL2ND: 2 (default) = matched Krylov operator+precond;
+    // 1 = Krylov matrix action only; 0 = first-order everywhere.
+    static int const s_sol2nd = [] {
+        char const* s = std::getenv("AMREX_MLCC_SOL2ND");
+        return s ? std::atoi(s) : 2;
+    }();
+    bool const sol2nd = (s_sol2nd != 0)
+        && (m_matrix_apply || (s_sol2nd >= 2 && m_precond_mode))
+        && (s_mode == StateMode::Solution)
+        && (m_num_amr_levels > 1);
+    applyBC(amrlev, mglev, in, CurlCurlStateType::x, homogeneous, sol2nd);
 
     auto dxinv = this->m_geom[amrlev][mglev].InvCellSizeArray();
     auto adxinv = dxinv;
@@ -1730,6 +1756,62 @@ void MLCurlCurl::reflux (int crse_amrlev, MF& res,
         }
         Gpu::streamSynchronize();
     }
+
+#if (AMREX_SPACEDIM == 2)
+    // ---- Charge-consistent assembly, phase 1 (see avgDownResAmr) ----
+    // Stash the reference field rhs_c - beta o composite_sol. The true
+    // composite residual r = rhs - alpha curl(curl) x - beta o x has
+    // discrete divergence div(rhs) - div(beta o x) exactly: the
+    // curl(curl) part telescopes to zero identically at every node
+    // whose incident edges exist, for any coefficients. Both rhs_c and
+    // composite_sol are single, globally defined coarse fields (the
+    // covered values are the trace average-down of the fine level), so
+    // div(stash) is the charge the assembled coarse residual SHOULD
+    // have — free of the boundary-term garbage that the stitched
+    // assembly (reflux rows at uncov, restricted fine residual at cov)
+    // manufactures at CF ring/corner nodes. avgDownResAmr corrects
+    // div(res0) to this target via a beta-weighted Hodge subtraction.
+    static int const s_kcharge_reflux = [] {
+        char const* s = std::getenv("AMREX_MLCC_KCHARGE");
+        return s ? std::atoi(s) : 1;
+    }();
+    if (s_kcharge_reflux) {
+        bool const has_beta_c = (m_bcoefs[crse_amrlev][0][0] != nullptr);
+        Real const bscalar = m_beta;
+        auto cdinfo2 = getDirichletInfo(crse_amrlev, 0);
+
+        for (int idim = 0; idim < 3; ++idim) {
+            m_kstash_crse[crse_amrlev][idim].define(
+                res[idim].boxArray(), res[idim].DistributionMap(), 1, 1);
+            m_kstash_crse[crse_amrlev][idim].setVal(Real(0.0));
+        }
+
+        for (int idim = 0; idim < 2; ++idim) {
+            auto const& kc = m_kstash_crse[crse_amrlev][idim].arrays();
+            auto const& rh = crse_rhs[idim].const_arrays();
+            auto const& xc = composite_sol[idim].const_arrays();
+            auto const& bca = has_beta_c
+                ? m_bcoefs[crse_amrlev][0][idim]->const_arrays()
+                : MultiArray4<Real const>{};
+            bool const hb = has_beta_c;
+            Real const bs = bscalar;
+            int const dir = idim;
+            ParallelFor(m_kstash_crse[crse_amrlev][idim], IntVect(0),
+                [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+            {
+                if (cdinfo2.is_dirichlet_edge(dir,i,j,k)) {
+                    kc[b](i,j,k) = Real(0.0); // mirror zeroed residual rows
+                } else {
+                    Real const bb = hb ? bca[b](i,j,k) : bs;
+                    kc[b](i,j,k) = rh[b](i,j,k) - bb * xc[b](i,j,k);
+                }
+            });
+        }
+        Gpu::streamSynchronize();
+
+        m_kstash_valid[crse_amrlev] = 1;
+    }
+#endif
 }
 
 // ========================================================================
@@ -1765,6 +1847,25 @@ void MLCurlCurl::avgDownResAmr (int clev, MF& cres, MF const& fres) const
     }
     MF const& fres_use = *pfres;
 
+    // Deposit-kernel variant (experimental, default off): at covered
+    // coarse edges whose full-weighting stencil would read a true
+    // CF-ghost edge (the zero-extension sites), deposit the trace
+    // restriction instead (mlcurlcurl_restriction_cc). Tested while
+    // root-causing the composite corner charges: it reshapes the corner
+    // charge into a near-dipole but does not remove it (the charge
+    // balance pairs the cov deposits against the reflux rows), so it is
+    // kept only as a diagnostic variant. AMREX_MLCC_CC_ASSEMBLY=1
+    // enables it; the production charge fix is the K-split correction
+    // below (AMREX_MLCC_KCHARGE).
+    static int const s_cc_assembly = [] {
+        char const* s = std::getenv("AMREX_MLCC_CC_ASSEMBLY");
+        return s ? std::atoi(s) : 0;
+    }();
+    bool const use_cc = (s_cc_assembly != 0)
+        && m_cfmask[flev][0][0] != nullptr
+        && m_cfmask[flev][0][1] != nullptr
+        && m_cfmask[flev][0][2] != nullptr;
+
     for (int idim = 0; idim < 3; ++idim) {
         BoxArray cfba = fres_use[idim].boxArray();
         cfba.coarsen(ratio);
@@ -1774,12 +1875,23 @@ void MLCurlCurl::avgDownResAmr (int clev, MF& cres, MF const& fres) const
 
         auto const& crsema = crse_from_fine.arrays();
         auto const& finema = fres_use[idim].const_arrays();
-        ParallelFor(crse_from_fine,
-            [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k)
-        {
-            mlcurlcurl_restriction(idim, i, j, k,
-                                   crsema[bno], finema[bno], dinfo);
-        });
+        if (use_cc) {
+            auto const& cfma = m_cfmask[flev][0][idim]->const_arrays();
+            ParallelFor(crse_from_fine,
+                [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k)
+            {
+                mlcurlcurl_restriction_cc(idim, i, j, k,
+                                          crsema[bno], finema[bno], dinfo,
+                                          cfma[bno]);
+            });
+        } else {
+            ParallelFor(crse_from_fine,
+                [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k)
+            {
+                mlcurlcurl_restriction(idim, i, j, k,
+                                       crsema[bno], finema[bno], dinfo);
+            });
+        }
         Gpu::streamSynchronize();
 
         // Overwrite covered region of coarse residual
@@ -1787,24 +1899,126 @@ void MLCurlCurl::avgDownResAmr (int clev, MF& cres, MF const& fres) const
     }
 
 #if (AMREX_SPACEDIM == 2)
-    // ---- Charge projection experiment (env-gated, default off) ----
+    // ---- Charge-consistent assembly, phase 2 (default on) ----
     // The stitched composite residual (reflux rows at uncov, restricted
     // fine residual at cov) carries O(alpha/h^2)-scale point charges
-    // (discrete-divergence sources) at CF corner nodes: the adjoint
-    // identity div_c(P^T r_f) = P_n^T(div_f r_f) holds in the interior
-    // of the covered region, but its boundary term at interface nodes is
-    // dropped by the assembly. True curl-curl residuals have only
-    // beta-scale divergence, so the coarse solve's gradient channel
-    // (eigenvalue beta) responds to these charges with a spurious smooth
-    // gradient correction of amplitude ~charge/beta. At convex-corner
-    // geometries the per-corner charges nearly cancel in pairs; at
-    // re-entrant (staircase) corners they reinforce => rho ~ delta/beta
-    // and composite divergence. Setting AMREX_MLCC_PROJECT_CHARGE=1
-    // removes the divergence content of the assembled coarse residual:
-    // solve the nodal Poisson Delta phi = div(cres) (plain CG) and
-    // subtract G phi. This also removes the (beta-scale) genuine
-    // gradient-channel residual, so it is a mechanism test, not a
-    // production fix.
+    // (discrete-divergence sources) at CF corner nodes — the dropped
+    // boundary term of the restriction's adjoint identity. True
+    // curl-curl residuals have only beta-scale divergence, so the
+    // coarse solve's gradient channel (eigenvalue beta) responds to
+    // these charges with a spurious smooth gradient correction of
+    // amplitude ~charge/beta: at convex-corner geometries the
+    // per-corner charges nearly cancel in pairs; at re-entrant
+    // (staircase) corners they reinforce => rho ~ delta(geometry)/beta
+    // and composite divergence (CURLCURL_AMR_CONTRACTION_ROOT_CAUSE.md).
+    //
+    // The spurious charge is identified exactly: assemble, with the
+    // identical stitch, the alpha*curl(curl) components of the residual
+    // stashed by reflux. Level-wise, div o (alpha curl curl) == 0
+    // identically at every node whose incident edges exist, so the
+    // stitched K-charge is pure ring/corner boundary-term garbage and
+    // carries none of the genuine gradient-channel signal (which lives
+    // in the rhs- and beta-parts). Its beta-weighted Hodge image is
+    // then subtracted from the assembled residual. Disable with
+    // AMREX_MLCC_KCHARGE=0.
+    static int const s_kcharge = [] {
+        char const* s = std::getenv("AMREX_MLCC_KCHARGE");
+        return s ? std::atoi(s) : 1;
+    }();
+    if (s_kcharge && m_kstash_valid[clev]) {
+        m_kstash_valid[clev] = 0;
+        auto const& period = m_geom[clev][0].periodicity();
+        auto const h = m_geom[clev][0].CellSizeArray();
+        auto cdinfo = getDirichletInfo(clev, 0);
+
+        for (int idim = 0; idim < 2; ++idim) {
+            cres[idim].FillBoundary(period);
+            m_kstash_crse[clev][idim].FillBoundary(period);
+        }
+
+        // q_corr = div(cres) - div(rhs_c - beta o composite_sol):
+        // the assembled charge minus the charge the true composite
+        // residual has (its alpha curl(curl) part is divergence-free
+        // identically). Nonzero q_corr is the stitch's boundary-term
+        // garbage, concentrated on the CF ring and its corners. The
+        // reference carries an O(corner-roughness) bias at the ring
+        // (avg-down seam of the reference field), so the iteration
+        // converges to a residual floor set by that bias rather than to
+        // zero; the floor shrinks with the corner error (see the
+        // 2nd-order solution-path ghosts) and a Krylov wrap
+        // (composite=2) converges fully regardless.
+        BoxArray ndba = amrex::convert(m_grids[clev][0], IntVect(1));
+        MultiFab q(ndba, m_dmap[clev][0], 1, 0);
+        {
+            auto const& qa = q.arrays();
+            auto const& fx = cres[0].const_arrays();
+            auto const& fy = cres[1].const_arrays();
+            auto const& sx = m_kstash_crse[clev][0].const_arrays();
+            auto const& sy = m_kstash_crse[clev][1].const_arrays();
+            ParallelFor(q, [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+            {
+                if (cdinfo.is_dirichlet_node(i,j,k)) {
+                    qa[b](i,j,k) = Real(0.0);
+                } else {
+                    qa[b](i,j,k) =
+                        ((fx[b](i,j,k)-sx[b](i,j,k))
+                        -(fx[b](i-1,j,k)-sx[b](i-1,j,k)))/h[0]
+                      + ((fy[b](i,j,k)-sy[b](i,j,k))
+                        -(fy[b](i,j-1,k)-sy[b](i,j-1,k)))/h[1];
+                }
+            });
+            Gpu::streamSynchronize();
+            amrex::OverrideSync(q, getDotMask(clev,0,2), period);
+        }
+
+        static int const s_kcharge_verbose = [] {
+            char const* s = std::getenv("AMREX_MLCC_KCHARGE_VERBOSE");
+            return s ? std::atoi(s) : 0;
+        }();
+        if (s_kcharge_verbose) {
+            // Split diagnostics: assembled charge vs target charge.
+            MultiFab qa_mf(ndba, m_dmap[clev][0], 1, 0);
+            MultiFab qt_mf(ndba, m_dmap[clev][0], 1, 0);
+            auto const& qaa = qa_mf.arrays();
+            auto const& qta = qt_mf.arrays();
+            auto const& fx = cres[0].const_arrays();
+            auto const& fy = cres[1].const_arrays();
+            auto const& sx = m_kstash_crse[clev][0].const_arrays();
+            auto const& sy = m_kstash_crse[clev][1].const_arrays();
+            ParallelFor(qa_mf,
+                [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+            {
+                if (cdinfo.is_dirichlet_node(i,j,k)) {
+                    qaa[b](i,j,k) = Real(0.0);
+                    qta[b](i,j,k) = Real(0.0);
+                } else {
+                    qaa[b](i,j,k) = (fx[b](i,j,k)-fx[b](i-1,j,k))/h[0]
+                                  + (fy[b](i,j,k)-fy[b](i,j-1,k))/h[1];
+                    qta[b](i,j,k) = (sx[b](i,j,k)-sx[b](i-1,j,k))/h[0]
+                                  + (sy[b](i,j,k)-sy[b](i,j-1,k))/h[1];
+                }
+            });
+            Gpu::streamSynchronize();
+            amrex::Print() << "[kcharge] lev" << clev
+                           << " max|q_assembled|=" << qa_mf.norminf()
+                           << " max|q_target|=" << qt_mf.norminf() << "\n";
+        }
+
+        hodgeNeutralizeCharge(clev, cres, q, /*ring_only=*/true);
+
+        for (int idim = 0; idim < 3; ++idim) {
+            m_kstash_crse[clev][idim] = MultiFab();
+            m_kstash_fine[clev][idim] = MultiFab();
+        }
+    }
+
+    // ---- Charge projection diagnostic (env-gated, default off) ----
+    // AMREX_MLCC_PROJECT_CHARGE=1|2 removes the FULL divergence content
+    // of the assembled coarse residual (ring-restricted | everywhere).
+    // Unlike the K-split above this also deletes the genuine beta-scale
+    // gradient-channel residual, so the iteration stalls at the orphaned
+    // modes' amplitude — kept as the mechanism test from the
+    // root-cause investigation, not for production use.
     static int const s_project_charge = [] {
         char const* s = std::getenv("AMREX_MLCC_PROJECT_CHARGE");
         return s ? std::atoi(s) : 0;
@@ -1836,73 +2050,88 @@ void MLCurlCurl::avgDownResAmr (int clev, MF& cres, MF const& fres) const
             });
             Gpu::streamSynchronize();
             amrex::OverrideSync(q, getDotMask(clev,0,2), period);
-
-            // Restrict the projection to the CF ring (default on): the
-            // spurious charge lives at interface/corner nodes; the
-            // genuine beta-scale divergence is domain-wide and must be
-            // kept so gradient errors still receive coarse correction.
-            // AMREX_MLCC_PROJECT_CHARGE=2 projects everywhere instead.
-            if (s_project_charge == 1
-                && m_fine_mask[clev][0] != nullptr)
-            {
-                // Ghosted copies of the edge fine-masks so ring detection
-                // works across box boundaries (fine_mask itself has 0
-                // ghosts). Out-of-domain ghosts default to 1 (uncovered).
-                iMultiFab xm(m_fine_mask[clev][0]->boxArray(),
-                             m_dmap[clev][0], 1, 1);
-                iMultiFab ym(m_fine_mask[clev][1]->boxArray(),
-                             m_dmap[clev][0], 1, 1);
-                xm.setVal(1); ym.setVal(1);
-                iMultiFab::Copy(xm, *m_fine_mask[clev][0], 0, 0, 1, 0);
-                iMultiFab::Copy(ym, *m_fine_mask[clev][1], 0, 0, 1, 0);
-                xm.FillBoundary(period);
-                ym.FillBoundary(period);
-
-                iMultiFab ring(ndba, m_dmap[clev][0], 1, 1);
-                ring.setVal(0);
-                auto const& ra = ring.arrays();
-                auto const& mx = xm.const_arrays();
-                auto const& my = ym.const_arrays();
-                ParallelFor(ring,
-                    [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
-                {
-                    auto const& ax = mx[b];
-                    auto const& ay = my[b];
-                    int ncov = 0, nunc = 0;
-                    (ax(i-1,j,k)==0 ? ncov : nunc) += 1;
-                    (ax(i  ,j,k)==0 ? ncov : nunc) += 1;
-                    (ay(i,j-1,k)==0 ? ncov : nunc) += 1;
-                    (ay(i,j  ,k)==0 ? ncov : nunc) += 1;
-                    ra[b](i,j,k) = (ncov > 0 && nunc > 0) ? 1 : 0;
-                });
-                Gpu::streamSynchronize();
-                ring.FillBoundary(period);
-                // grow the ring by one node
-                iMultiFab ring2(ndba, m_dmap[clev][0], 1, 0);
-                auto const& r2a = ring2.arrays();
-                auto const& r1a = ring.const_arrays();
-                ParallelFor(ring2,
-                    [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
-                {
-                    int s = 0;
-                    for (int dj = -1; dj <= 1; ++dj) {
-                    for (int di = -1; di <= 1; ++di) {
-                        s += r1a[b](i+di,j+dj,k);
-                    }}
-                    r2a[b](i,j,k) = (s > 0) ? 1 : 0;
-                });
-                Gpu::streamSynchronize();
-                auto const& qa2 = q.arrays();
-                auto const& rfin = ring2.const_arrays();
-                ParallelFor(q,
-                    [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
-                {
-                    if (rfin[b](i,j,k) == 0) { qa2[b](i,j,k) = Real(0.0); }
-                });
-                Gpu::streamSynchronize();
-            }
         }
-        bool const is_periodic = m_geom[clev][0].isAllPeriodic();
+        hodgeNeutralizeCharge(clev, cres, q,
+                              /*ring_only=*/(s_project_charge == 1));
+    }
+#endif
+}
+
+#if (AMREX_SPACEDIM == 2)
+void MLCurlCurl::hodgeNeutralizeCharge (int clev, MF& cres, MultiFab& q,
+                                        bool ring_only) const
+{
+    BL_PROFILE("MLCurlCurl::hodgeNeutralizeCharge()");
+
+    auto const& period = m_geom[clev][0].periodicity();
+    auto const h = m_geom[clev][0].CellSizeArray();
+    auto cdinfo = getDirichletInfo(clev, 0);
+    BoxArray ndba = q.boxArray();
+
+    // Restrict the charge to the CF ring (+1 node): the spurious
+    // boundary-term charge lives at interface/corner nodes; whatever
+    // genuine divergence content the input may carry elsewhere must be
+    // kept so gradient errors still receive coarse correction.
+    if (ring_only && m_fine_mask[clev][0] != nullptr)
+    {
+        // Ghosted copies of the edge fine-masks so ring detection
+        // works across box boundaries (fine_mask itself has 0
+        // ghosts). Out-of-domain ghosts default to 1 (uncovered).
+        iMultiFab xm(m_fine_mask[clev][0]->boxArray(),
+                     m_dmap[clev][0], 1, 1);
+        iMultiFab ym(m_fine_mask[clev][1]->boxArray(),
+                     m_dmap[clev][0], 1, 1);
+        xm.setVal(1); ym.setVal(1);
+        iMultiFab::Copy(xm, *m_fine_mask[clev][0], 0, 0, 1, 0);
+        iMultiFab::Copy(ym, *m_fine_mask[clev][1], 0, 0, 1, 0);
+        xm.FillBoundary(period);
+        ym.FillBoundary(period);
+
+        iMultiFab ring(ndba, m_dmap[clev][0], 1, 1);
+        ring.setVal(0);
+        auto const& ra = ring.arrays();
+        auto const& mx = xm.const_arrays();
+        auto const& my = ym.const_arrays();
+        ParallelFor(ring,
+            [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+        {
+            auto const& ax = mx[b];
+            auto const& ay = my[b];
+            int ncov = 0, nunc = 0;
+            (ax(i-1,j,k)==0 ? ncov : nunc) += 1;
+            (ax(i  ,j,k)==0 ? ncov : nunc) += 1;
+            (ay(i,j-1,k)==0 ? ncov : nunc) += 1;
+            (ay(i,j  ,k)==0 ? ncov : nunc) += 1;
+            ra[b](i,j,k) = (ncov > 0 && nunc > 0) ? 1 : 0;
+        });
+        Gpu::streamSynchronize();
+        ring.FillBoundary(period);
+        // grow the ring by one node
+        iMultiFab ring2(ndba, m_dmap[clev][0], 1, 0);
+        auto const& r2a = ring2.arrays();
+        auto const& r1a = ring.const_arrays();
+        ParallelFor(ring2,
+            [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+        {
+            int s = 0;
+            for (int dj = -1; dj <= 1; ++dj) {
+            for (int di = -1; di <= 1; ++di) {
+                s += r1a[b](i+di,j+dj,k);
+            }}
+            r2a[b](i,j,k) = (s > 0) ? 1 : 0;
+        });
+        Gpu::streamSynchronize();
+        auto const& qa2 = q.arrays();
+        auto const& rfin = ring2.const_arrays();
+        ParallelFor(q,
+            [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+        {
+            if (rfin[b](i,j,k) == 0) { qa2[b](i,j,k) = Real(0.0); }
+        });
+        Gpu::streamSynchronize();
+    }
+
+    bool const is_periodic = m_geom[clev][0].isAllPeriodic();
         if (is_periodic) {
             // remove mean for solvability (use owner mask to count each
             // node once)
@@ -2065,9 +2294,10 @@ void MLCurlCurl::avgDownResAmr (int clev, MF& cres, MF const& fres) const
             });
             Gpu::streamSynchronize();
         }
-    }
-#endif
 }
+#else
+void MLCurlCurl::hodgeNeutralizeCharge (int, MF&, MultiFab&, bool) const {}
+#endif
 
 // ========================================================================
 // averageDownSolutionRHS

@@ -517,6 +517,161 @@ MyTest::solve ()
         }
       }
 
+      // ---- Probe Y (probe_asym=1): tabulate the composite assembly's
+      // charge operator near a CF corner. For each edge DOF e in a
+      // window around (asym_cx, asym_cy) (coarse-node coords), assemble
+      // the raw composite coarse residual of the unit impulse state
+      // X = delta_e (rhs = 0) and print the resulting ring-node charges
+      // above a threshold. Alpha-scale entries identify the asymmetric
+      // interface couplings (a weighted-symmetric composite operator
+      // generates only beta-scale charge). Run serial with
+      // AMREX_MLCC_KCHARGE=0 to see the uncorrected assembly.
+      {
+        int probe_asym = 0;
+        { ParmParse ppa; ppa.query("probe_asym", probe_asym); }
+        if (probe_asym) {
+          int ccx = 40, ccy = 24;
+          Real qthresh = 500.0;
+          { ParmParse ppa; ppa.query("asym_cx", ccx); ppa.query("asym_cy", ccy);
+            ppa.query("asym_qthresh", qthresh); }
+          auto const hc = geom[0].CellSizeArray();
+
+          // cov/uncov classification of coarse edges
+          auto is_cov = [&] (int dir, int i, int j) -> bool {
+            BoxArray eba = amrex::convert(amrex::coarsen(grids[1], 2),
+                                          dir == 0 ? IntVect(0,1) : IntVect(1,0));
+            return eba.contains(Box(IntVect(i,j), IntVect(i,j),
+                                    dir == 0 ? IntVect(0,1) : IntVect(1,0)));
+          };
+
+          auto charge_map = [&] (std::string const& label) {
+            V res0 = make_zero(0);
+            V res1 = make_zero(1);
+            V zb0 = make_zero(0);
+            V zb1 = make_zero(1);
+            mlcc.solutionResidual(1, res1, solution[1], zb1, &solution[0]);
+            mlcc.solutionResidual(0, res0, solution[0], zb0, nullptr);
+            mlcc.reflux(0, res0, solution[0], zb0, res1, solution[1], zb1);
+            mlcc.avgDownResAmr(0, res0, res1);
+            for (int idim = 0; idim < 2; ++idim) {
+              res0[idim].FillBoundary(geom[0].periodicity());
+            }
+            for (MFIter mfi(res0[0]); mfi.isValid(); ++mfi) {
+              auto const& fx = res0[0].const_array(mfi);
+              auto const& fy = res0[1].const_array(mfi);
+              Box nb = amrex::surroundingNodes(mfi.validbox());
+              nb.grow(-1);
+              amrex::LoopOnCpu(nb, [&] (int i, int j, int k)
+              {
+                if (std::abs(i-ccx) <= 4 && std::abs(j-ccy) <= 4) {
+                  Real q = (fx(i,j,k)-fx(i-1,j,k))/hc[0]
+                         + (fy(i,j,k)-fy(i,j-1,k))/hc[1];
+                  if (std::abs(q) > qthresh) {
+                    amrex::Print() << "  [asym] " << label << " -> q("
+                                   << i << "," << j << ") = " << q << "\n";
+                  }
+                }
+              });
+            }
+          };
+
+          auto set_impulse = [&] (int lev, int dir, int i, int j) {
+            for (int l = 0; l < (int)geom.size(); ++l) {
+              for (auto& m : solution[l]) { m.setVal(0.0); }
+            }
+            for (MFIter mfi(solution[lev][dir]); mfi.isValid(); ++mfi) {
+              auto const& a = solution[lev][dir].array(mfi);
+              if (mfi.validbox().contains(IntVect(i,j))) {
+                a(i,j,0) = 1.0;
+              }
+            }
+          };
+
+          // Coarse uncovered edges in the window.
+          for (int dir = 0; dir < 2; ++dir) {
+            for (int j = ccy-2; j <= ccy+2; ++j) {
+            for (int i = ccx-2; i <= ccx+2; ++i) {
+              if (is_cov(dir, i, j)) { continue; }
+              set_impulse(0, dir, i, j);
+              charge_map("crse " + std::string(dir==0?"Ex":"Ey") + "("
+                         + std::to_string(i) + "," + std::to_string(j) + ")");
+            }}
+          }
+          // Fine edges in the window (2x refined coords).
+          for (int dir = 0; dir < 2; ++dir) {
+            for (int j = 2*ccy-4; j <= 2*ccy+4; ++j) {
+            for (int i = 2*ccx-4; i <= 2*ccx+4; ++i) {
+              BoxArray eba = amrex::convert(grids[1],
+                                  dir == 0 ? IntVect(0,1) : IntVect(1,0));
+              if (!eba.contains(Box(IntVect(i,j), IntVect(i,j),
+                                    dir == 0 ? IntVect(0,1) : IntVect(1,0)))) {
+                continue;
+              }
+              set_impulse(1, dir, i, j);
+              charge_map("fine " + std::string(dir==0?"Ex":"Ey") + "("
+                         + std::to_string(i) + "," + std::to_string(j) + ")");
+            }}
+          }
+          return;
+        }
+      }
+
+      // ---- Probe W (probe_w=1): tabulate the row-to-charge map of the
+      // cov-side restriction alone: impulse the fine residual at each
+      // row near the corner, deposit via avgDownResAmr onto a zeroed
+      // coarse residual, and print the resulting node charges. Run
+      // serial with AMREX_MLC_KCHARGE=0.
+      {
+        int probe_w = 0;
+        { ParmParse ppw2; ppw2.query("probe_w", probe_w); }
+        if (probe_w) {
+          int ccx = 40, ccy = 24;
+          { ParmParse ppa; ppa.query("asym_cx", ccx); ppa.query("asym_cy", ccy); }
+          auto const hc = geom[0].CellSizeArray();
+          for (int dir = 0; dir < 2; ++dir) {
+            for (int j = 2*ccy-3; j <= 2*ccy+3; ++j) {
+            for (int i = 2*ccx-3; i <= 2*ccx+3; ++i) {
+              BoxArray eba = amrex::convert(grids[1],
+                                  dir == 0 ? IntVect(0,1) : IntVect(1,0));
+              if (!eba.contains(Box(IntVect(i,j), IntVect(i,j),
+                                    dir == 0 ? IntVect(0,1) : IntVect(1,0)))) {
+                continue;
+              }
+              V fres = make_zero(1);
+              for (MFIter mfi(fres[dir]); mfi.isValid(); ++mfi) {
+                auto const& a = fres[dir].array(mfi);
+                if (mfi.validbox().contains(IntVect(i,j))) { a(i,j,0) = 1.0; }
+              }
+              V res0 = make_zero(0);
+              mlcc.avgDownResAmr(0, res0, fres);
+              for (int idim = 0; idim < 2; ++idim) {
+                res0[idim].FillBoundary(geom[0].periodicity());
+              }
+              for (MFIter mfi(res0[0]); mfi.isValid(); ++mfi) {
+                auto const& fx = res0[0].const_array(mfi);
+                auto const& fy = res0[1].const_array(mfi);
+                Box nb = amrex::surroundingNodes(mfi.validbox());
+                nb.grow(-1);
+                amrex::LoopOnCpu(nb, [&] (int ii, int jj, int kk)
+                {
+                  if (std::abs(ii-ccx) <= 3 && std::abs(jj-ccy) <= 3) {
+                    Real q = (fx(ii,jj,kk)-fx(ii-1,jj,kk))/hc[0]
+                           + (fy(ii,jj,kk)-fy(ii,jj-1,kk))/hc[1];
+                    if (std::abs(q) > 1e-8) {
+                      amrex::Print() << "  [w] fine "
+                                     << (dir==0?"Ex":"Ey") << "(" << i << ","
+                                     << j << ") -> q(" << ii << "," << jj
+                                     << ") = " << q << "\n";
+                    }
+                  }
+                });
+              }
+            }}
+          }
+          return;
+        }
+      }
+
       // ---- Probe P: correction-prolongation path ----
       {
         V cor_f = make_zero(1);
@@ -760,7 +915,12 @@ MyTest::solve ()
     GMRESMLMGT<V> gmsolver(mlmg);
     gmsolver.setVerbose(verbose);
     {
-      int gmres_precond_iters = 1;
+      // 4 MLMG iterations per GMRES preconditioner application: with the
+      // second-order operator presented to GMRES (AMREX_MLCC_SOL2ND,
+      // default on) the corner near-null modes need the stronger
+      // preconditioner; 1 suffices for the first-order operator
+      // (AMREX_MLCC_SOL2ND=0).
+      int gmres_precond_iters = 4;
       int gmres_max_iters = max_iter;
       // Default Krylov restart scales with AMR depth: each extra AMR
       // level coarsening adds spectral spread to the MLMG-preconditioned

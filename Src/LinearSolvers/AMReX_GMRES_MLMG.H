@@ -259,7 +259,12 @@ void GMRESMLMGT<MF>::linComb (VEC& lhs, RT a, VEC const& rhs_a, RT b, VEC const&
 template <typename MF>
 void GMRESMLMGT<MF>::apply (VEC& lhs, VEC const& rhs) const
 {
+    // Bracket the OUTER matrix action so the operator may present a
+    // more accurate discretization to GMRES than the one used inside
+    // the preconditioner (see MLLinOpT::beginMatrixApply).
+    m_linop->beginMatrixApply();
     m_mlmg->applyPrecond(GetVecOfPtrs(lhs), GetVecOfPtrs(const_cast<VEC&>(rhs)));
+    m_linop->endMatrixApply();
 }
 
 template <typename MF>

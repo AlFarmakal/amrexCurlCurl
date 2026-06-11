@@ -566,6 +566,14 @@ public:
     virtual void beginPrecondBC () { m_precond_mode = true; }
     virtual void endPrecondBC () { m_precond_mode = false; }
 
+    //! Brackets the outer Krylov MATRIX action (as opposed to the
+    //! preconditioner's internal applies). Lets an operator present a
+    //! more accurate discretization to the Krylov solver than the one
+    //! its smoother/cycle machinery is built around (e.g. MLCurlCurl's
+    //! second-order CF-ghost solution path).
+    virtual void beginMatrixApply () {}
+    virtual void endMatrixApply () {}
+
     [[nodiscard]] bool isMFIterSafe (int amrlev, int mglev1, int mglev2) const;
 
     //! Return the number of AMR levels
