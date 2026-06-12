@@ -191,15 +191,23 @@ private:
     //! coarse data (solution equation). sol2nd selects the second-order
     //! CF-ghost prolongation (solution path of multi-level composite
     //! solves; the correction path keeps the lowest-order curl-
-    //! conforming interpolation).
+    //! conforming interpolation). allow_pocket_hom permits the
+    //! homogeneous pocket-cell ghost fill (state-type only) that makes
+    //! apply()'s correction-path operator see the symmetrized pocket
+    //! couplings; the GS smoother passes false so its sweeps keep the
+    //! plain zero-ghost stencil (the precomputed block diagonals match).
     void applyBC (int amrlev, int mglev, MF& in, CurlCurlStateType type,
-                  bool homogeneous = false, bool sol2nd = false) const;
+                  bool homogeneous = false, bool sol2nd = false,
+                  bool allow_pocket_hom = true) const;
 
     //! Fill CF ghost cells using m_cfmask to avoid corrupting same-level
-    //! neighbor ghosts. When homogeneous is true, writes zero. When false,
-    //! interpolates from m_crse_sol_br (second order when sol2nd).
+    //! neighbor ghosts. When homogeneous is true, writes zero (except at
+    //! pocket-cell ghosts of state-type fills when pocket_hom is set —
+    //! see mlcurlcurl_interpset_pocket_hom). When false, interpolates
+    //! from m_crse_sol_br (second order when sol2nd).
     void fillCoarseFineBoundary (int amrlev, MF& mf, bool homogeneous,
-                                 bool sol2nd = false) const;
+                                 bool sol2nd = false,
+                                 bool pocket_hom = false) const;
 
     //! Build CF masks for all AMR/MG levels.
     void buildCFMasks ();
@@ -212,6 +220,15 @@ private:
     //! projection in avgDownResAmr.
     void hodgeNeutralizeCharge (int clev, MF& cres, MultiFab& q,
                                 bool ring_only) const;
+
+    //! Diagonal-preconditioned CG for the beta-weighted nodal Poisson
+    //! -div(beta grad phi) = q on level lev's nodal grids (periodic
+    //! mean removal included; Dirichlet phi=0 at domain boundary nodes
+    //! otherwise). Used by hodgeNeutralizeCharge's far-field solve for
+    //! middle-level (clev > 0) corrections. phi must be defined on the
+    //! level's nodal BoxArray with 1 ghost; on return it is
+    //! owner-synced with filled boundaries.
+    void betaNodalPoissonCG (int lev, MultiFab& phi, MultiFab& q) const;
 
     //! Build fine coverage masks for all AMR levels except the finest.
     void buildFineMask ();
@@ -267,6 +284,33 @@ private:
     //! Fine coverage mask: 0=covered by finer level, 1=not covered.
     //! [amrlev][idim]. Only for amrlev < finest.
     mutable Vector<Array<std::unique_ptr<iMultiFab>,3>> m_fine_mask;
+
+#if (AMREX_SPACEDIM == 2)
+    //! Coarse-edge coverage brought onto the coarsened-fine layout
+    //! (2 ghosts, matching the CF-fill coarse temporaries):
+    //! 1=uncovered, 0=covered. [amrlev][idim] indexed by the FINE level
+    //! (amrlev > 0), components 0 and 1 only. Consumed by the
+    //! pocket-symmetrized CF ghost fill (mlcurlcurl_interpset_pocket).
+    mutable Vector<Array<std::unique_ptr<iMultiFab>,3>> m_cov_mask_fine;
+
+    //! Number of re-entrant (pocket) CF corner cells per coarse level
+    //! [crse_amrlev]. When the pocket symmetrization is active and a
+    //! level has pockets, the charge-consistent Hodge correction
+    //! (AMREX_MLCC_KCHARGE) is skipped on that level: the symmetrized
+    //! assembly removes the pocket charge structurally and the Hodge
+    //! reference would fight it (large residual floor). Pocket-free
+    //! levels keep the previous behavior bit-identically.
+    mutable Vector<int> m_num_pockets;
+
+    //! Coarsest-level Hodge potential from the previous assembly
+    //! (nodal, level 0): with AMREX_MLCC_KCHARGE_FARFIELD=2 it supplies
+    //! the middle-level patch solve's boundary data (lagged composite
+    //! coupling — exact at the stationary fixed point), making the
+    //! middle correction's harmonic part consistent with the coarse
+    //! level's instead of truncating it at the patch boundary.
+    mutable MultiFab m_hodge_phi_crse;
+    mutable int m_hodge_phi_valid = 0;
+#endif
 
     //! Stash of the alpha*curl(curl) components of the fields entering
     //! the composite residual assembly, per coarse AMR level: filled by

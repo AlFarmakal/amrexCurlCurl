@@ -4,6 +4,22 @@
 
 namespace amrex {
 
+#if (AMREX_SPACEDIM == 2)
+namespace {
+// Pocket-corner symmetrization gate (re-entrant CF corners): injection
+// pocket-cell CF ghosts + matched reflux-row compensation. Default on;
+// AMREX_MLCC_POCKETSYM=0 restores the previous (asymmetric) assembly.
+bool pocketsym ()
+{
+    static int const r = [] {
+        char const* s = std::getenv("AMREX_MLCC_POCKETSYM");
+        return s ? std::atoi(s) : 1;
+    }();
+    return r != 0;
+}
+}
+#endif
+
 MLCurlCurl::MLCurlCurl (const Vector<Geometry>& a_geom,
                         const Vector<BoxArray>& a_grids,
                         const Vector<DistributionMapping>& a_dmap,
@@ -517,8 +533,12 @@ void MLCurlCurl::buildCFMasks ()
 
 void MLCurlCurl::fillCoarseFineBoundary (int amrlev, MF& mf,
                                           bool homogeneous,
-                                          bool sol2nd) const
+                                          bool sol2nd,
+                                          bool pocket_hom) const
 {
+#if (AMREX_SPACEDIM != 2)
+    amrex::ignore_unused(pocket_hom);
+#endif
     if (m_cfmask[amrlev][0][0] == nullptr) { return; }
 
     // mf may be a 0-ghost MultiFab (e.g., GMRES Krylov vector allocated
@@ -558,6 +578,46 @@ void MLCurlCurl::fillCoarseFineBoundary (int amrlev, MF& mf,
                     sol[bno](i,j,k) = Real(0.0);
                 }
             });
+#if (AMREX_SPACEDIM == 2)
+            // Pocket-cell ghosts: fill with the fine-readable part of
+            // the symmetrized pocket fill's fine content so the level
+            // smoother and the correction-path applies see the pocket
+            // block of the composite operator (state-type fills only;
+            // the residual-type homogeneous fill used by the assembly
+            // keeps ghosts = 0, so the assembled fixed point is
+            // untouched). AMREX_MLCC_POCKETSYM_HOM=0 disables.
+            // See mlcurlcurl_interpset_pocket_hom.
+            static int const s_pocket_hom = [] {
+                char const* s = std::getenv("AMREX_MLCC_POCKETSYM_HOM");
+                return s ? std::atoi(s) : 1;
+            }();
+            bool const use_pocket_hom = pocket_hom
+                && (s_pocket_hom != 0)
+                && pocketsym()
+                && !(m_matrix_apply || m_precond_mode)
+                && (idim < 2)
+                && (amrlev > 0)
+                && (amrlev < static_cast<int>(m_cov_mask_fine.size()))
+                && m_cov_mask_fine[amrlev][0] != nullptr
+                && m_cov_mask_fine[amrlev][1] != nullptr;
+            if (use_pocket_hom) {
+                auto const& crossfine = mf[1-idim].const_arrays();
+                auto const& cova  = m_cov_mask_fine[amrlev][idim]->const_arrays();
+                auto const& covca = m_cov_mask_fine[amrlev][1-idim]->const_arrays();
+                int const dir = idim;
+                ParallelFor(mf[idim], IntVect(1),
+                    [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k)
+                {
+                    if (mask[bno](i,j,k) != 0) {
+                        mlcurlcurl_interpset_pocket_hom(dir, i, j, k,
+                                                        sol[bno],
+                                                        crossfine[bno],
+                                                        cova[bno],
+                                                        covca[bno]);
+                    }
+                });
+            }
+#endif
         }
         else
         {
@@ -594,6 +654,27 @@ void MLCurlCurl::fillCoarseFineBoundary (int amrlev, MF& mf,
             // interpset that the cycle's transfers are built around.
             bool const high_order_cf = (this->m_num_amr_levels == 1)
                                        || sol2nd;
+#if (AMREX_SPACEDIM == 2)
+            // Pocket-symmetrized first-order fill (re-entrant CF
+            // corners): the four pocket-cell ghosts gain the
+            // antisymmetric face-trace correction that makes the
+            // composite assembly weighted-symmetric. Used by the pure
+            // stationary cycle only; under an outer Krylov solve
+            // (matrix action or preconditioner context) the original
+            // fills are kept so the matched second-order GMRES
+            // machinery is bit-identical to its tuned behavior.
+            // AMREX_MLCC_POCKETSYM=0 restores the plain interpset fill.
+            // See mlcurlcurl_interpset_pocket.
+            bool const use_pocket = !high_order_cf
+                && pocketsym()
+                && !(m_matrix_apply || m_precond_mode)
+                && (idim < 2)
+                && (amrlev > 0)
+                && (amrlev < static_cast<int>(m_cov_mask_fine.size()))
+                && m_cov_mask_fine[amrlev][0] != nullptr
+                && m_cov_mask_fine[amrlev][1] != nullptr
+                && m_crse_sol_br[amrlev][1-idim] != nullptr;
+#endif
             if (high_order_cf) {
                 ParallelFor(mf[idim], IntVect(1),
                     [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k)
@@ -603,7 +684,34 @@ void MLCurlCurl::fillCoarseFineBoundary (int amrlev, MF& mf,
                                                   sol[bno], crsearr[bno]);
                     }
                 });
-            } else {
+            }
+#if (AMREX_SPACEDIM == 2)
+            else if (use_pocket) {
+                int const jdim = 1 - idim;
+                MultiFab crsecross_on_cfba(
+                    amrex::convert(crse_ba, m_etype[jdim]),
+                    mf[idim].DistributionMap(), 1, 2);
+                crsecross_on_cfba.ParallelCopy(
+                    *m_crse_sol_br[amrlev][jdim], 0, 0, 1,
+                    IntVect(2), IntVect(2));
+                auto const& crosscrse = crsecross_on_cfba.const_arrays();
+                auto const& crossfine = mf[jdim].const_arrays();
+                auto const& cova  = m_cov_mask_fine[amrlev][idim]->const_arrays();
+                auto const& covca = m_cov_mask_fine[amrlev][jdim]->const_arrays();
+                ParallelFor(mf[idim], IntVect(1),
+                    [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k)
+                {
+                    if (mask[bno](i,j,k) != 0) {
+                        mlcurlcurl_interpset_pocket(dir, i, j, k,
+                                                    sol[bno], crsearr[bno],
+                                                    crossfine[bno],
+                                                    crosscrse[bno],
+                                                    cova[bno], covca[bno]);
+                    }
+                });
+            }
+#endif
+            else {
                 ParallelFor(mf[idim], IntVect(1),
                     [=] AMREX_GPU_DEVICE (int bno, int i, int j, int k)
                 {
@@ -624,7 +732,7 @@ void MLCurlCurl::fillCoarseFineBoundary (int amrlev, MF& mf,
 
 void MLCurlCurl::applyBC (int amrlev, int mglev, MF& in,
                            CurlCurlStateType type, bool homogeneous,
-                           bool sol2nd) const
+                           bool sol2nd, bool allow_pocket_hom) const
 {
     int nmfs = 3;
 #if (AMREX_SPACEDIM == 2)
@@ -640,7 +748,16 @@ void MLCurlCurl::applyBC (int amrlev, int mglev, MF& in,
     // Step 1: FillBoundary — same-level ghost exchange
     FillBoundary(mfs, this->m_geom[amrlev][mglev].periodicity());
 
-    // Step 2: CF ghost fill (masked — only true CF ghosts are touched)
+    // Step 2: CF ghost fill (masked — only true CF ghosts are touched).
+    // The homogeneous pocket fill applies to state-type (x) data only:
+    // residual-type fills must keep zero CF ghosts so the assembly's
+    // restriction (and hence the composite fixed point) is unchanged.
+    // The smoother's sweeps also keep zero ghosts (allow_pocket_hom is
+    // false there): the pocket couplings belong to the operator that
+    // apply() evaluates, while gs4 remains a preconditioner on the
+    // plain level stencil.
+    bool const pocket_hom = allow_pocket_hom && homogeneous
+        && (type == CurlCurlStateType::x);
 #if MLCC_CF_GALERKIN
     // Also fire at amrlev==0 for single-level + setCoarseFineBC, so that
     // CF ghosts get zeroed (homog) or interpolated-coarse (inhomog).
@@ -649,11 +766,11 @@ void MLCurlCurl::applyBC (int amrlev, int mglev, MF& in,
         && ((amrlev > 0) ||
             (amrlev == 0 && this->needsCoarseDataForBC()));
     if (cf_fill) {
-        fillCoarseFineBoundary(amrlev, in, homogeneous, sol2nd);
+        fillCoarseFineBoundary(amrlev, in, homogeneous, sol2nd, pocket_hom);
     }
 #else
     if (amrlev > 0 && mglev == 0 && type != CurlCurlStateType::b) {
-        fillCoarseFineBoundary(amrlev, in, homogeneous, sol2nd);
+        fillCoarseFineBoundary(amrlev, in, homogeneous, sol2nd, pocket_hom);
     }
 #endif
 
@@ -1291,9 +1408,13 @@ void MLCurlCurl::smooth (int amrlev, int mglev, MF& sol, const MF& rhs,
     for (int i = 0; i < niter; ++i) {
         for (int color = 0; color < ncolors; ++color) {
             if (!skip_fillboundary) {
-                // Correction equation → homogeneous CF BCs
+                // Correction equation → homogeneous CF BCs. The GS
+                // sweeps keep zero pocket ghosts (the stored block
+                // diagonals match the plain level stencil); the pocket
+                // couplings are seen by apply()'s residuals only.
                 applyBC(amrlev, mglev, sol, CurlCurlStateType::x,
-                        /*homogeneous=*/true);
+                        /*homogeneous=*/true, /*sol2nd=*/false,
+                        /*allow_pocket_hom=*/false);
             }
             skip_fillboundary = false;
 #if (AMREX_SPACEDIM == 1)
@@ -1775,7 +1896,30 @@ void MLCurlCurl::reflux (int crse_amrlev, MF& res,
         char const* s = std::getenv("AMREX_MLCC_KCHARGE");
         return s ? std::atoi(s) : 1;
     }();
-    if (s_kcharge_reflux) {
+    // With the pocket symmetrization active, the pure STATIONARY cycle
+    // skips the KCHARGE correction on FINEST-interface levels
+    // (crse_amrlev == 0) that have pocket (re-entrant) CF corners: the
+    // symmetrized assembly removes the pocket charge structurally, and
+    // the Hodge reference (built from the avg-down trace) would fight
+    // it, leaving a large residual floor. MIDDLE levels
+    // (crse_amrlev > 0) always run KCHARGE: their seam charges are
+    // re-amplified by the up-leg's second prolongation before any
+    // coarse solve can correct them (the 3-level divergence mechanism),
+    // and hodgeNeutralizeCharge masks the pocket-cell nodes out of the
+    // charge there so the correction does not fight the pocket fill.
+    // Under an outer Krylov solve (matrix action or preconditioner
+    // context) KCHARGE stays on everywhere: the matched second-order
+    // GMRES machinery requires it (it stalls at O(1) relative residual
+    // without it — pre-existing, independent of the pocket fill).
+    // Pocket-free levels keep the previous behavior bit-identically.
+    // AMREX_MLCC_KCHARGE=2 forces KCHARGE on everywhere.
+    bool const kcharge_here = s_kcharge_reflux
+        && (s_kcharge_reflux >= 2
+            || m_matrix_apply || m_precond_mode
+            || crse_amrlev > 0
+            || m_num_amr_levels > 2
+            || !(pocketsym() && m_num_pockets[crse_amrlev] > 0));
+    if (kcharge_here) {
         bool const has_beta_c = (m_bcoefs[crse_amrlev][0][0] != nullptr);
         Real const bscalar = m_beta;
         auto cdinfo2 = getDirichletInfo(crse_amrlev, 0);
@@ -1931,6 +2075,17 @@ void MLCurlCurl::avgDownResAmr (int clev, MF& cres, MF const& fres) const
         auto const h = m_geom[clev][0].CellSizeArray();
         auto cdinfo = getDirichletInfo(clev, 0);
 
+        // Note: the finer (middle) level's Hodge correction rides into
+        // this level's covered rows through the residual restriction.
+        // Do NOT fold it into the reference here: at the coupled fixed
+        // point the finer level's corrected residual vanishes (its raw
+        // residual cancels the correction), so the restriction carries
+        // no net correction content and a folded-in reference would be
+        // inconsistent (tested: it re-ignites the 3-level divergence).
+        // The levels' corrections couple self-consistently as is, at
+        // the cost of a geometry-dependent stationary floor; removing
+        // that floor needs a composite (multi-level) auxiliary-space
+        // solve instead of the per-level ones.
         for (int idim = 0; idim < 2; ++idim) {
             cres[idim].FillBoundary(period);
             m_kstash_crse[clev][idim].FillBoundary(period);
@@ -2058,6 +2213,129 @@ void MLCurlCurl::avgDownResAmr (int clev, MF& cres, MF const& fres) const
 }
 
 #if (AMREX_SPACEDIM == 2)
+void MLCurlCurl::betaNodalPoissonCG (int lev, MultiFab& phi, MultiFab& q) const
+{
+    BL_PROFILE("MLCurlCurl::betaNodalPoissonCG()");
+
+    auto const& period = m_geom[lev][0].periodicity();
+    auto const h = m_geom[lev][0].CellSizeArray();
+    auto cdinfo = getDirichletInfo(lev, 0);
+    auto const& dm = getDotMask(lev, 0, 2);
+    BoxArray const& ndba = q.boxArray();
+    DistributionMapping const& dmap = q.DistributionMap();
+
+    bool const hb = (m_bcoefs[lev][0][0] != nullptr);
+    MultiArray4<Real const> bxa, bya;
+    if (hb) {
+        bxa = m_bcoefs[lev][0][0]->const_arrays();
+        bya = m_bcoefs[lev][0][1]->const_arrays();
+    }
+    Real const bs = m_beta;
+
+    auto mdot = [&] (MultiFab const& a, MultiFab const& b2) -> Real {
+        auto const& aa = a.const_arrays();
+        auto const& ba = b2.const_arrays();
+        auto const& ma = dm.const_arrays();
+        GpuTuple<Real> t = ParReduce(TypeList<ReduceOpSum>{},
+                                     TypeList<Real>{}, a, IntVect(0),
+            [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+                -> GpuTuple<Real>
+        {
+            return { aa[b](i,j,k)*ba[b](i,j,k)*Real(ma[b](i,j,k)) };
+        });
+        Real s = amrex::get<0>(t);
+        ParallelAllReduce::Sum(s, ParallelContext::CommunicatorSub());
+        return s;
+    };
+
+    if (m_geom[lev][0].isAllPeriodic()) {
+        // remove mean for solvability
+        auto const& qa = q.const_arrays();
+        auto const& ma = dm.const_arrays();
+        GpuTuple<Real,Real> t = ParReduce(
+            TypeList<ReduceOpSum,ReduceOpSum>{},
+            TypeList<Real,Real>{}, q, IntVect(0),
+            [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+                -> GpuTuple<Real,Real>
+        {
+            return { qa[b](i,j,k) * Real(ma[b](i,j,k)),
+                     Real(ma[b](i,j,k)) };
+        });
+        Real both[2] = {amrex::get<0>(t), amrex::get<1>(t)};
+        ParallelAllReduce::Sum(both, 2, ParallelContext::CommunicatorSub());
+        q.plus(-both[0]/both[1], 0, 1, 0);
+    }
+
+    MultiFab rr (ndba, dmap, 1, 0);
+    MultiFab pp (ndba, dmap, 1, 1);
+    MultiFab Ap (ndba, dmap, 1, 0);
+    MultiFab zz (ndba, dmap, 1, 0);
+    phi.setVal(Real(0.0));
+    pp.setVal(Real(0.0));
+    MultiFab::Copy(rr, q, 0, 0, 1, 0);
+
+    auto precond = [&] (MultiFab& z, MultiFab const& r) {
+        auto const& za = z.arrays();
+        auto const& ra = r.const_arrays();
+        ParallelFor(z, [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+        {
+            Real bxm = hb ? bxa[b](i-1,j,k) : bs;
+            Real bxp = hb ? bxa[b](i  ,j,k) : bs;
+            Real bym = hb ? bya[b](i,j-1,k) : bs;
+            Real byp = hb ? bya[b](i,j  ,k) : bs;
+            Real diag = (bxm+bxp)/(h[0]*h[0]) + (bym+byp)/(h[1]*h[1]);
+            za[b](i,j,k) = ra[b](i,j,k) / std::max(diag, Real(1e-300));
+        });
+        Gpu::streamSynchronize();
+    };
+
+    precond(zz, rr);
+    MultiFab::Copy(pp, zz, 0, 0, 1, 0);
+    Real rz = mdot(rr, zz);
+    Real const rr00 = mdot(rr, rr);
+    int const maxcg = 600;
+    for (int it = 0; it < maxcg; ++it) {
+        if (mdot(rr, rr) <= Real(1e-24)*rr00) { break; }
+        amrex::OverrideSync(pp, dm, period);
+        pp.FillBoundary(period);
+        {
+            auto const& apa = Ap.arrays();
+            auto const& pa = pp.const_arrays();
+            ParallelFor(Ap,
+                [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+            {
+                if (cdinfo.is_dirichlet_node(i,j,k)) {
+                    apa[b](i,j,k) = pa[b](i,j,k);
+                } else {
+                    Real bxm = hb ? bxa[b](i-1,j,k) : bs;
+                    Real bxp = hb ? bxa[b](i  ,j,k) : bs;
+                    Real bym = hb ? bya[b](i,j-1,k) : bs;
+                    Real byp = hb ? bya[b](i,j  ,k) : bs;
+                    apa[b](i,j,k) =
+                        -((bxp*(pa[b](i+1,j,k)-pa[b](i,j,k))
+                          -bxm*(pa[b](i,j,k)-pa[b](i-1,j,k)))/(h[0]*h[0])
+                        + (byp*(pa[b](i,j+1,k)-pa[b](i,j,k))
+                          -bym*(pa[b](i,j,k)-pa[b](i,j-1,k)))/(h[1]*h[1]));
+                }
+            });
+            Gpu::streamSynchronize();
+        }
+        Real pAp = mdot(pp, Ap);
+        if (pAp <= Real(0.0)) { break; }
+        Real alpha_cg = rz/pAp;
+        MultiFab::Saxpy(phi, alpha_cg, pp, 0, 0, 1, 0);
+        MultiFab::Saxpy(rr, -alpha_cg, Ap, 0, 0, 1, 0);
+        precond(zz, rr);
+        Real rznew = mdot(rr, zz);
+        Real beta_cg = rznew/rz;
+        rz = rznew;
+        MultiFab::LinComb(pp, Real(1.0), zz, 0, beta_cg, pp, 0, 0, 1,
+                          IntVect(0));
+    }
+    amrex::OverrideSync(phi, dm, period);
+    phi.FillBoundary(period);
+}
+
 void MLCurlCurl::hodgeNeutralizeCharge (int clev, MF& cres, MultiFab& q,
                                         bool ring_only) const
 {
@@ -2129,9 +2407,164 @@ void MLCurlCurl::hodgeNeutralizeCharge (int clev, MF& cres, MultiFab& q,
             if (rfin[b](i,j,k) == 0) { qa2[b](i,j,k) = Real(0.0); }
         });
         Gpu::streamSynchronize();
+
+        // Pocket-aware charge mask: when the pocket symmetrization is
+        // active (stationary assembly), the pocket-cell corner charges
+        // are removed structurally by the symmetrized fills, and the
+        // Hodge reference (avg-down trace) is wrong exactly there —
+        // correcting them would fight the pocket fill (large residual
+        // floor). Zero the charge at nodes incident to pocket cells so
+        // KCHARGE handles only the flat-face/convex seam charges (the
+        // 1/beta-amplified content the pocket fill does not address).
+        // Default OFF: masking the pocket nodes out of the charge
+        // leaves their (symmetric, alpha-scale) dipole charges in the
+        // assembled residual; a finest-interface coarse level handles
+        // them via its exact MG solve (2-level contraction), but a
+        // MIDDLE level's partial solve amplifies them through its
+        // gradient channel and the cycle diverges. The unmasked
+        // correction is stable everywhere; its disagreement with the
+        // pocket fill only costs accuracy in the fixed point (floor),
+        // which the stationary gating avoids at finest interfaces by
+        // skipping KCHARGE there altogether.
+        static int const s_pocketmask = [] {
+            char const* s = std::getenv("AMREX_MLCC_KCHARGE_POCKETMASK");
+            return s ? std::atoi(s) : 0;
+        }();
+        if (pocketsym()
+            && (s_pocketmask != 0)
+            && !(m_matrix_apply || m_precond_mode)
+            && m_num_pockets[clev] > 0)
+        {
+            auto const& qa3 = q.arrays();
+            auto const& mx2 = xm.const_arrays();
+            auto const& my2 = ym.const_arrays();
+            ParallelFor(q,
+                [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+            {
+                bool adj = false;
+                for (int cj = j-1; cj <= j; ++cj) {
+                for (int ci = i-1; ci <= i; ++ci) {
+                    if (mx2[b](ci,cj  ,k) + mx2[b](ci,cj+1,k) == 1
+                     && my2[b](ci,cj  ,k) + my2[b](ci+1,cj,k) == 1) {
+                        adj = true;
+                    }
+                }}
+                if (adj) { qa3[b](i,j,k) = Real(0.0); }
+            });
+            Gpu::streamSynchronize();
+        }
     }
 
-    bool const is_periodic = m_geom[clev][0].isAllPeriodic();
+    // ---- Far-field boundary data for middle-level patch solves ----
+    // For clev > 0 the nodal CG below runs on the level's patch
+    // BoxArray with frozen-zero ghosts — homogeneous Dirichlet a few
+    // cells from the CF ring. The charge response decays slowly, so the
+    // truncation biases the correction and sets a large stationary
+    // floor (verified: widening the patch shrinks the 3-level tube
+    // floor 0.0198 -> 1e-6). Supply the far field instead: restrict q
+    // to the domain-covering level 0 (charge-preserving nodal full
+    // weighting), solve the same beta-weighted nodal Poisson there
+    // (betaNodalPoissonCG), interpolate the result back (nodal
+    // bilinear, valid + 1 ghost), and let the patch CG solve only the
+    // remaining defect on top of it with its homogeneous-Dirichlet
+    // ghosts. Implemented for clev == 1 / ref_ratio 2 (the 3-level
+    // hierarchy); deeper middle levels keep the previous behavior.
+    // Modes: 0 (default) = off; 1 = solve the restricted charge on the
+    // domain-covering level 0 each call (fresh far field; empirically
+    // moves the floors only marginally while costing a second CG per
+    // assembly); 2 = lagged composite coupling: use the PREVIOUS
+    // assembly's level-0 Hodge potential as the patch boundary data —
+    // exact at the stationary fixed point, making the middle-level
+    // correction's harmonic part consistent with the coarse level's.
+    static int const s_farfield = [] {
+        char const* s = std::getenv("AMREX_MLCC_KCHARGE_FARFIELD");
+        return s ? std::atoi(s) : 0;
+    }();
+    bool const stationary_ctx = !(m_matrix_apply || m_precond_mode);
+    bool const have_farfield =
+        ((s_farfield == 1)
+         || (s_farfield == 2 && m_hodge_phi_valid && stationary_ctx))
+        && (clev == 1) && (this->AMRRefRatio(0) == 2);
+    MultiFab Iphi0;
+    if (have_farfield) {
+        auto const& period0 = m_geom[clev-1][0].periodicity();
+        BoxArray cndba = ndba;
+        cndba.coarsen(2);
+
+        MultiFab phi0_own;
+        MultiFab const* phi0p = &m_hodge_phi_crse;
+        if (s_farfield == 1) {
+            // q with one ghost for the full-weighting reads.
+            MultiFab qg(ndba, m_dmap[clev][0], 1, 1);
+            qg.setVal(Real(0.0));
+            MultiFab::Copy(qg, q, 0, 0, 1, IntVect(0));
+            qg.FillBoundary(period);
+
+            // Charge-preserving nodal full weighting onto the
+            // coarsened patch layout.
+            MultiFab qc(cndba, m_dmap[clev][0], 1, 0);
+            {
+                auto const& qca = qc.arrays();
+                auto const& qfa = qg.const_arrays();
+                ParallelFor(qc,
+                    [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+                {
+                    int const ii = 2*i;
+                    int const jj = 2*j;
+                    qca[b](i,j,k) = Real(0.25) * qfa[b](ii,jj,k)
+                        + Real(0.125)  * (qfa[b](ii-1,jj  ,k) + qfa[b](ii+1,jj  ,k)
+                                        + qfa[b](ii  ,jj-1,k) + qfa[b](ii  ,jj+1,k))
+                        + Real(0.0625) * (qfa[b](ii-1,jj-1,k) + qfa[b](ii+1,jj-1,k)
+                                        + qfa[b](ii-1,jj+1,k) + qfa[b](ii+1,jj+1,k));
+                });
+                Gpu::streamSynchronize();
+            }
+
+            // Solve on level clev-1 (covers the domain for clev == 1).
+            BoxArray const nd0 = amrex::convert(m_grids[clev-1][0],
+                                                IntVect(1));
+            MultiFab q0(nd0, m_dmap[clev-1][0], 1, 0);
+            q0.setVal(Real(0.0));
+            q0.ParallelCopy(qc, 0, 0, 1, IntVect(0), IntVect(0), period0);
+            phi0_own.define(nd0, m_dmap[clev-1][0], 1, 1);
+            betaNodalPoissonCG(clev-1, phi0_own, q0);
+            phi0p = &phi0_own;
+        }
+
+        // Interpolate the coarse potential to the patch (valid + 1
+        // ghost): the ghost values become the patch CG's effective
+        // Dirichlet data.
+        MultiFab c0(cndba, m_dmap[clev][0], 1, 2);
+        c0.setVal(Real(0.0));
+        c0.ParallelCopy(*phi0p, 0, 0, 1, IntVect(1), IntVect(2), period0);
+        Iphi0.define(ndba, m_dmap[clev][0], 1, 1);
+        auto const& ia = Iphi0.arrays();
+        auto const& ca = c0.const_arrays();
+        ParallelFor(Iphi0, IntVect(1),
+            [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+        {
+            int const ic = amrex::coarsen(i,2);
+            int const jc = amrex::coarsen(j,2);
+            bool const iodd = (2*ic != i);
+            bool const jodd = (2*jc != j);
+            if (iodd && jodd) {
+                ia[b](i,j,k) = Real(0.25)*(ca[b](ic  ,jc  ,k)
+                                          +ca[b](ic+1,jc  ,k)
+                                          +ca[b](ic  ,jc+1,k)
+                                          +ca[b](ic+1,jc+1,k));
+            } else if (iodd) {
+                ia[b](i,j,k) = Real(0.5)*(ca[b](ic,jc,k)+ca[b](ic+1,jc,k));
+            } else if (jodd) {
+                ia[b](i,j,k) = Real(0.5)*(ca[b](ic,jc,k)+ca[b](ic,jc+1,k));
+            } else {
+                ia[b](i,j,k) = ca[b](ic,jc,k);
+            }
+        });
+        Gpu::streamSynchronize();
+    }
+
+    bool const is_periodic = m_geom[clev][0].isAllPeriodic()
+        && !have_farfield;
         if (is_periodic) {
             // remove mean for solvability (use owner mask to count each
             // node once)
@@ -2178,7 +2611,39 @@ void MLCurlCurl::hodgeNeutralizeCharge (int clev, MF& cres, MultiFab& q,
         MultiFab Ap (ndba, m_dmap[clev][0], 1, 0);
         MultiFab zz (ndba, m_dmap[clev][0], 1, 0);
         phi.setVal(0.0); pp.setVal(0.0);
-        MultiFab::Copy(rr, q, 0, 0, 1, 0);
+        if (have_farfield) {
+            // rr = q - A(Iphi0): the patch CG solves the defect on top
+            // of the interpolated far field (whose ghost values carry
+            // the boundary data).
+            auto const& rra = rr.arrays();
+            auto const& qa4 = q.const_arrays();
+            auto const& pa0 = Iphi0.const_arrays();
+            auto const& bxa = cg_bx;
+            auto const& bya = cg_by;
+            bool const hb = cg_has_beta;
+            Real const bs = cg_bscalar;
+            ParallelFor(rr,
+                [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+            {
+                if (cdinfo.is_dirichlet_node(i,j,k)) {
+                    rra[b](i,j,k) = Real(0.0);
+                } else {
+                    Real bxm = hb ? bxa[b](i-1,j,k) : bs;
+                    Real bxp = hb ? bxa[b](i  ,j,k) : bs;
+                    Real bym = hb ? bya[b](i,j-1,k) : bs;
+                    Real byp = hb ? bya[b](i,j  ,k) : bs;
+                    Real Ap0 =
+                        -((bxp*(pa0[b](i+1,j,k)-pa0[b](i,j,k))
+                          -bxm*(pa0[b](i,j,k)-pa0[b](i-1,j,k)))/(h[0]*h[0])
+                        + (byp*(pa0[b](i,j+1,k)-pa0[b](i,j,k))
+                          -bym*(pa0[b](i,j,k)-pa0[b](i,j-1,k)))/(h[1]*h[1]));
+                    rra[b](i,j,k) = qa4[b](i,j,k) - Ap0;
+                }
+            });
+            Gpu::streamSynchronize();
+        } else {
+            MultiFab::Copy(rr, q, 0, 0, 1, 0);
+        }
         auto const& dm = getDotMask(clev,0,2);
         auto precond = [&] (MultiFab& z, MultiFab const& r) {
             auto const& za = z.arrays();
@@ -2263,14 +2728,23 @@ void MLCurlCurl::hodgeNeutralizeCharge (int clev, MF& cres, MultiFab& q,
         amrex::OverrideSync(phi, dm, period);
         phi.FillBoundary(period);
 
+        if (have_farfield) {
+            // Total response = interpolated far field + patch defect.
+            // phi's frozen-zero outside-patch ghosts leave Iphi0's
+            // far-field boundary values intact there.
+            MultiFab::Add(Iphi0, phi, 0, 0, 1, IntVect(1));
+        }
+        MultiFab const& phitot = have_farfield ? Iphi0 : phi;
+
         // Subtract the operator-range gradient field carrying the charge:
         // div(beta G phi) = -A phi = -q, so cres += beta o G(phi) makes
         // div(cres_new) = q - q = 0, and the removed field beta o G(phi)
         // is exactly L(G phi) — the component the coarse gradient
         // channel would have amplified by 1/beta.
+        //
         {
             auto const& fx = cres[0].arrays();
-            auto const& pa = phi.const_arrays();
+            auto const& pa = phitot.const_arrays();
             auto const& bxa = cg_bx;
             bool const hb = cg_has_beta;
             Real const bs = cg_bscalar;
@@ -2294,9 +2768,25 @@ void MLCurlCurl::hodgeNeutralizeCharge (int clev, MF& cres, MultiFab& q,
             });
             Gpu::streamSynchronize();
         }
+
+        // Lagged composite coupling (far-field mode 2): keep the
+        // coarsest level's potential for the next assembly's
+        // middle-level patch boundary data. Stationary context only
+        // (a lagged dependence would make the GMRES matrix action
+        // non-stationary across Krylov vectors).
+        if (s_farfield == 2 && clev == 0 && m_num_amr_levels > 2
+            && stationary_ctx)
+        {
+            if (!m_hodge_phi_crse.ok()) {
+                m_hodge_phi_crse.define(ndba, m_dmap[0][0], 1, 1);
+            }
+            MultiFab::Copy(m_hodge_phi_crse, phitot, 0, 0, 1, IntVect(1));
+            m_hodge_phi_valid = 1;
+        }
 }
 #else
 void MLCurlCurl::hodgeNeutralizeCharge (int, MF&, MultiFab&, bool) const {}
+void MLCurlCurl::betaNodalPoissonCG (int, MultiFab&, MultiFab&) const {}
 #endif
 
 // ========================================================================
@@ -2521,6 +3011,67 @@ void MLCurlCurl::buildFineMask ()
             Gpu::streamSynchronize();
         }
     }
+
+#if (AMREX_SPACEDIM == 2)
+    // Coarse-edge coverage on the coarsened-fine layout, for the
+    // pocket-symmetrized CF ghost fill (mlcurlcurl_interpset_pocket).
+    // Ghosts default to 1 (uncovered) so out-of-level reads never
+    // satisfy the pocket conditions.
+    m_cov_mask_fine.clear();
+    m_cov_mask_fine.resize(m_num_amr_levels);
+    m_num_pockets.clear();
+    m_num_pockets.resize(m_num_amr_levels, 0);
+    for (int amrlev = 0; amrlev < m_num_amr_levels - 1; ++amrlev) {
+        int const flev = amrlev + 1;
+        IntVect ratio(this->AMRRefRatio(amrlev));
+        for (int idim = 0; idim < 2; ++idim) {
+            BoxArray cfba = amrex::convert(m_grids[flev][0], m_etype[idim]);
+            cfba.coarsen(ratio);
+            m_cov_mask_fine[flev][idim] = std::make_unique<iMultiFab>(
+                cfba, m_dmap[flev][0], 1, 2);
+            m_cov_mask_fine[flev][idim]->setVal(1);
+            m_cov_mask_fine[flev][idim]->ParallelCopy(
+                *m_fine_mask[amrlev][idim], 0, 0, 1,
+                IntVect(0), IntVect(2),
+                m_geom[amrlev][0].periodicity());
+        }
+
+        // Count pocket cells (exactly one covered horizontal edge AND
+        // exactly one covered vertical edge): a nonzero count makes
+        // avgDownResAmr skip the KCHARGE Hodge correction on this
+        // coarse level (see m_num_pockets). Pocket cells live OUTSIDE
+        // the fine region (missing quadrant), so count on the coarse
+        // level's cell layout, with 1-ghost coverage copies for the
+        // edge reads at box boundaries.
+        {
+            auto const& period = m_geom[amrlev][0].periodicity();
+            Array<iMultiFab,2> fm;
+            for (int idim = 0; idim < 2; ++idim) {
+                fm[idim].define(m_fine_mask[amrlev][idim]->boxArray(),
+                                m_fine_mask[amrlev][idim]->DistributionMap(),
+                                1, 1);
+                fm[idim].setVal(1);
+                iMultiFab::Copy(fm[idim], *m_fine_mask[amrlev][idim],
+                                0, 0, 1, 0);
+                fm[idim].FillBoundary(period);
+            }
+            iMultiFab cells(m_grids[amrlev][0], m_dmap[amrlev][0], 1, 0);
+            auto const& ca  = cells.arrays();
+            auto const& cvx = fm[0].const_arrays();
+            auto const& cvy = fm[1].const_arrays();
+            ParallelFor(cells,
+                [=] AMREX_GPU_DEVICE (int b, int i, int j, int k)
+            {
+                ca[b](i,j,k) =
+                    ((cvx[b](i,j,k) + cvx[b](i,j+1,k) == 1)
+                  && (cvy[b](i,j,k) + cvy[b](i+1,j,k) == 1)) ? 1 : 0;
+            });
+            Gpu::streamSynchronize();
+            Long const np = cells.sum(0);
+            m_num_pockets[amrlev] = static_cast<int>(np);
+        }
+    }
+#endif
 }
 
 // ========================================================================
@@ -2944,4 +3495,4 @@ void MLCurlCurl::applyPhysBC (int amrlev, int mglev, MultiFab& mf,
     }
 }
 
-}
+}

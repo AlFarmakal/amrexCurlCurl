@@ -1492,7 +1492,19 @@ MyTest::initData ()
       else if (tube_refine_kind == "box") refine_kind = KIND_BOX;
       // Walk the lev-1 BoxArray, tile each lev-1 box by max_grid_size, keep
       // tiles touching the lev-2 refinement region.
+      //
+      // Proper nesting: the composite solver's CF machinery interpolates
+      // level-2 ghosts from level-1 data up to 2 (coarsened) cells beyond
+      // the coarsened level-2 footprint. Tiles that would leave less than
+      // 2 level-1 cells of buffer to the level-1 boundary are dropped
+      // (without this the tile-quantized staircases of the two interfaces
+      // can touch — zero nesting — and the composite solve reads
+      // uninitialized boundary-register data and diverges).
       BoxArray const& lev1_ba = grids[1];
+      int const nest_buf = 2;
+      BoxList cgl = lev1_ba.complementIn(geom[1].Domain());
+      for (auto& cb : cgl) { cb.grow(nest_buf); }
+      BoxArray const cgba(std::move(cgl));
       int const tile = max_grid_size;
       BoxList bl2;
       for (int ib = 0; ib < lev1_ba.size(); ++ib) {
@@ -1515,6 +1527,7 @@ MyTest::initData ()
               if (r >= r_lo && r < r_hi) keep = true;
             }
           }
+          if (keep && cgba.intersects(t)) { keep = false; } // proper nesting
           if (keep) bl2.push_back(t);
         }
       }
@@ -1527,6 +1540,26 @@ MyTest::initData ()
       grids[2] = amrex::refine(fine2_l1, ref_ratio);
       grids[2].maxSize(max_grid_size * ref_ratio * ref_ratio);
       dmap[2].define(grids[2]);
+      // Proper-nesting check: the composite solver's CF machinery reads
+      // level-1 data up to 2 (coarsened) cells beyond the coarsened
+      // level-2 footprint; report how much buffer the generated grids
+      // actually have.
+      {
+        BoxArray cba2 = grids[2];
+        cba2.coarsen(ref_ratio);
+        for (int nb = 1; nb <= 2; ++nb) {
+          BoxArray g = cba2;
+          g.grow(nb);
+          Box const d1 = geom[1].Domain();
+          BoxList gl;
+          for (int ib = 0; ib < g.size(); ++ib) {
+            gl.push_back(g[ib] & d1);
+          }
+          bool const ok = grids[1].contains(BoxArray(std::move(gl)));
+          amrex::Print() << "[nesting] lev2-in-lev1 buffer >= " << nb
+                         << " cells: " << (ok ? "yes" : "NO") << "\n";
+        }
+      }
     } else {
       // Manufactured: centered-half of lev 1's fine region.
       int lev1_lo = (fine_box_lo >= 0) ? fine_box_lo : n_cell / 4;

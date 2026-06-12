@@ -1497,6 +1497,197 @@ void mlcurlcurl_interpset (int dir, int i, int j, int k,
     }
 }
 
+#if (AMREX_SPACEDIM == 2)
+/**
+ * \brief CF-ghost fill with pocket-corner symmetrization (2D).
+ *
+ * Identical to mlcurlcurl_interpset everywhere except at the four ghost
+ * edges inside each re-entrant (pocket) CF corner cell, where the
+ * first-order fill makes the composite operator non-symmetric: through
+ * the mixed ghosts (0.5*slave + 0.5*uncov) the dxy cross-couplings of
+ * the assembled composite operator clash in sign, A(x2->y1) = -a*dxy/2
+ * vs A(y1->x2) = +a*dxy/2, which deposits O(alpha/h^2) spurious charges
+ * at pocket corners and (1/beta-amplified) breaks the stationary
+ * composite cycle (CURLCURL_AMR_CONTRACTION_ROOT_CAUSE.md).
+ *
+ * Derivation summary (pocket with fine region at -x/-y, corner coarse
+ * cell C, fine corner rows x1,x2 = Ex on the horizontal face and y1,y2
+ * = Ey on the vertical face, uncovered coarse edges U_x,U_y): writing
+ * each pocket-ghost fill as a Sum(w)=1 combination over
+ * {x1,x2,y1,y2,U_x,U_y} and imposing A(fi,fj)=A(fj,fi) and
+ * A(f,c)=4*A(c,f) (the 2D edge-volume weights) yields a one-parameter
+ * family of symmetric assembled matrices (parameter t). The choice must
+ * also keep the assembly charge-tame: the pure-injection corner of the
+ * design space (ghosts = U, paired with reflux-row compensation) is
+ * symmetric but its coarse-impulse columns deposit O(alpha/h^2) charge
+ * quadrupoles (the patched rows are not of curl form), which the
+ * coarse solve's gradient channel amplifies by 1/beta — catastrophic.
+ * Within the slave-weight family (charge-tame: impulse charges stay
+ * parent-edge-dipole patterned), t=0 minimizes the ghost-borne
+ * couplings the level smoother cannot see. The t=0 fill adds half the
+ * antisymmetric face-trace correction to BOTH ghosts of each component
+ * in the pocket cell:
+ *
+ *   ex(*,odd) += 0.5*(S_y - y_near)  (S_y = covered coarse Ey of C's
+ *                                     vertical face, y_near = its fine
+ *                                     child nearer the horizontal face)
+ *   ey(odd,*) += 0.5*(S_x - x_near)  (mirror)
+ *
+ * i.e. G1 = G2 = 0.5*S_x + 0.5*U_x + 0.25*(y2-y1), giving the local
+ * symmetric pocket block A(x1,y1)=A(x2,y2)=-1/2 with no induced
+ * x1<->x2, x1<->y2, x2<->y1 couplings, and fine<->uncov couplings
+ * +-1/2 = 4*(+-1/8) matching the coarse rows' slave couplings — so no
+ * reflux-row compensation is needed. The added term is the
+ * average-down-annihilated (antisymmetric) component of the face
+ * trace, so it vanishes identically on prolongated coarse fields (the
+ * curl-conforming prolongation identity P G_c = G_f P_n is untouched)
+ * and on locally-linear face traces (consistency: the fill still
+ * reproduces constants component-wise, Sum(w)=1). All other CF
+ * pairings (flat faces, convex corners, injection ghosts) are already
+ * exactly weighted-symmetric and stay unchanged. The general
+ * orientation follows by reflection covariance (Ex -> -Ex under
+ * x-reflection), giving the sx*sy sign.
+ *
+ * Reads: same-component coarse (crse), cross-component coarse
+ * (crsecross), cross-component fine trace (finecross, one valid edge
+ * within the 1-ghost reach of every patch that consumes the ghost),
+ * and the coarse-edge coverage masks on the coarsened-fine layout
+ * (cov/covcross, 1=uncovered, 0=covered, 2 ghosts). Out-of-range reads
+ * can only occur on patches whose valid rows never consume the ghost;
+ * they are guarded and leave the standard fill in place.
+ */
+/**
+ * \brief Homogeneous-mode (correction-path) pocket ghost fill (2D).
+ *
+ * The pocket-symmetrized composite operator (mlcurlcurl_interpset_pocket
+ * below) carries ghost-borne fine-fine couplings at the four pocket
+ * rows. With the conventional homogeneous CF fill (ghosts = 0) the
+ * level smoother never sees them and the prolongated coarse correction
+ * cannot reach them (the antisymmetric fill term vanishes on
+ * prolongated fields), leaving a beta-independent rho ~ 0.993 error
+ * mode pinned at the pocket. This kernel fills the pocket-cell ghosts
+ * in HOMOGENEOUS mode with the fine-readable part of the fill's fine
+ * content (coarse data = 0):
+ *
+ *   ex-ghosts = 1/4*(x1 + x2) + sx*sy/4*(y_far - y_near)   (mirror ey)
+ *
+ * dropping (via range guards) terms a filling patch cannot read. Each
+ * ghost copy is consumed only by rows owned by the patch that filled
+ * it, and per consuming row the dropped terms cancel exactly, so the
+ * effective level operator reproduces the full composite A_ff pocket
+ * block except the single x2<->y2 pair (whose member is two ghost
+ * layers outside the cross arm — fundamentally unreadable). Changing
+ * the homogeneous fill changes only the cycle's splitting, not the
+ * assembled fixed point: the residual-type (CurlCurlStateType::r)
+ * homogeneous fill used by the assembly keeps ghosts = 0.
+ */
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+void mlcurlcurl_interpset_pocket_hom (int dir, int i, int j, int k,
+                                      Array4<Real> const& fine,
+                                      Array4<Real const> const& finecross,
+                                      Array4<int const> const& cov,
+                                      Array4<int const> const& covcross)
+{
+    int const ic = amrex::coarsen(i,2);
+    int const jc = amrex::coarsen(j,2);
+    if (dir == 0) {
+        if (jc*2 == j) { return; }
+        int const cov_lo = cov(ic,jc  ,k);
+        int const cov_hi = cov(ic,jc+1,k);
+        if (cov_lo + cov_hi != 1) { return; }
+        int const sy = (cov_lo == 0) ? 1 : -1;
+        int const cov_l = covcross(ic  ,jc,k);
+        int const cov_r = covcross(ic+1,jc,k);
+        if (cov_l + cov_r != 1) { return; }
+        int const sx = (cov_l == 0) ? 1 : -1;
+        int const jcf = (sy > 0) ? 2*jc : 2*jc+2;   // fine Ex row, covered horizontal face
+        int const iyn = (sx > 0) ? 2*ic : 2*ic+2;   // fine Ey column, covered vertical face
+        int const jnear = (sy > 0) ? 2*jc   : 2*jc+1;
+        int const jfar  = (sy > 0) ? 2*jc+1 : 2*jc;
+        Real v = Real(0.0);
+        if (fine.contains(2*ic  ,jcf,k)) { v += Real(0.25)*fine(2*ic  ,jcf,k); }
+        if (fine.contains(2*ic+1,jcf,k)) { v += Real(0.25)*fine(2*ic+1,jcf,k); }
+        Real const ss = Real(0.25) * Real(sx*sy);
+        if (finecross.contains(iyn,jfar ,k)) { v += ss*finecross(iyn,jfar ,k); }
+        if (finecross.contains(iyn,jnear,k)) { v -= ss*finecross(iyn,jnear,k); }
+        fine(i,j,k) = v;
+    } else if (dir == 1) {
+        if (ic*2 == i) { return; }
+        int const cov_l = cov(ic  ,jc,k);
+        int const cov_r = cov(ic+1,jc,k);
+        if (cov_l + cov_r != 1) { return; }
+        int const sx = (cov_l == 0) ? 1 : -1;
+        int const cov_lo = covcross(ic,jc  ,k);
+        int const cov_hi = covcross(ic,jc+1,k);
+        if (cov_lo + cov_hi != 1) { return; }
+        int const sy = (cov_lo == 0) ? 1 : -1;
+        int const icf = (sx > 0) ? 2*ic : 2*ic+2;   // fine Ey column, covered vertical face
+        int const jxf = (sy > 0) ? 2*jc : 2*jc+2;   // fine Ex row, covered horizontal face
+        int const inear = (sx > 0) ? 2*ic   : 2*ic+1;
+        int const ifar  = (sx > 0) ? 2*ic+1 : 2*ic;
+        Real v = Real(0.0);
+        if (fine.contains(icf,2*jc  ,k)) { v += Real(0.25)*fine(icf,2*jc  ,k); }
+        if (fine.contains(icf,2*jc+1,k)) { v += Real(0.25)*fine(icf,2*jc+1,k); }
+        Real const ss = Real(0.25) * Real(sx*sy);
+        if (finecross.contains(ifar ,jxf,k)) { v += ss*finecross(ifar ,jxf,k); }
+        if (finecross.contains(inear,jxf,k)) { v -= ss*finecross(inear,jxf,k); }
+        fine(i,j,k) = v;
+    }
+}
+
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+void mlcurlcurl_interpset_pocket (int dir, int i, int j, int k,
+                                  Array4<Real> const& fine,
+                                  Array4<Real const> const& crse,
+                                  Array4<Real const> const& finecross,
+                                  Array4<Real const> const& crsecross,
+                                  Array4<int const> const& cov,
+                                  Array4<int const> const& covcross)
+{
+    mlcurlcurl_interpset(dir, i, j, k, fine, crse);
+
+    int const ic = amrex::coarsen(i,2);
+    int const jc = amrex::coarsen(j,2);
+    if (dir == 0) {
+        if (jc*2 == j) { return; } // not between two coarse Ex rows
+        // mixed normal pair: exactly one of the two coarse Ex rows covered
+        int const cov_lo = cov(ic,jc  ,k);
+        int const cov_hi = cov(ic,jc+1,k);
+        if (cov_lo + cov_hi != 1) { return; }
+        int const sy = (cov_lo == 0) ? 1 : -1; // fine region below : above
+        // pocket cell C=(ic,jc): exactly one vertical coarse Ey edge covered
+        int const cov_l = covcross(ic  ,jc,k);
+        int const cov_r = covcross(ic+1,jc,k);
+        if (cov_l + cov_r != 1) { return; }
+        int const sx = (cov_l == 0) ? 1 : -1; // fine region left : right
+        int const icv = (sx > 0) ? ic     : ic+1;   // covered coarse Ey (vertical face)
+        int const iyn = (sx > 0) ? 2*ic   : 2*ic+2; // fine Ey column on that face
+        int const jyn = (sy > 0) ? 2*jc   : 2*jc+1; // child nearer the horizontal face
+        if (finecross.contains(iyn,jyn,k) && crsecross.contains(icv,jc,k)) {
+            fine(i,j,k) += Real(0.5) * Real(sx*sy) *
+                (crsecross(icv,jc,k) - finecross(iyn,jyn,k));
+        }
+    } else if (dir == 1) {
+        if (ic*2 == i) { return; } // not between two coarse Ey columns
+        int const cov_l = cov(ic  ,jc,k);
+        int const cov_r = cov(ic+1,jc,k);
+        if (cov_l + cov_r != 1) { return; }
+        int const sx = (cov_l == 0) ? 1 : -1;
+        int const cov_lo = covcross(ic,jc  ,k);
+        int const cov_hi = covcross(ic,jc+1,k);
+        if (cov_lo + cov_hi != 1) { return; }
+        int const sy = (cov_lo == 0) ? 1 : -1;
+        int const jcv = (sy > 0) ? jc     : jc+1;   // covered coarse Ex (horizontal face)
+        int const jxn = (sy > 0) ? 2*jc   : 2*jc+2; // fine Ex row on that face
+        int const ixn = (sx > 0) ? 2*ic   : 2*ic+1; // child nearer the vertical face
+        if (finecross.contains(ixn,jxn,k) && crsecross.contains(ic,jcv,k)) {
+            fine(i,j,k) += Real(0.5) * Real(sx*sy) *
+                (crsecross(ic,jcv,k) - finecross(ixn,jxn,k));
+        }
+    }
+}
+#endif
+
 /**
  * \brief Higher-order coarse->fine edge interpolation for CF-ghost fill.
  *
