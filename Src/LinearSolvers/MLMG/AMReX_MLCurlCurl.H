@@ -225,10 +225,39 @@ private:
     //! -div(beta grad phi) = q on level lev's nodal grids (periodic
     //! mean removal included; Dirichlet phi=0 at domain boundary nodes
     //! otherwise). Used by hodgeNeutralizeCharge's far-field solve for
-    //! middle-level (clev > 0) corrections. phi must be defined on the
-    //! level's nodal BoxArray with 1 ghost; on return it is
-    //! owner-synced with filled boundaries.
-    void betaNodalPoissonCG (int lev, MultiFab& phi, MultiFab& q) const;
+    //! middle-level (clev > 0) corrections and by the composite AMS
+    //! correction. phi must be defined on the level's nodal BoxArray
+    //! with 1 ghost; on return it is owner-synced with filled
+    //! boundaries. When inhom is given (valid + 1 ghost), the CG solves
+    //! the defect on top of it (its ghost values supply the Dirichlet
+    //! boundary data) and phi returns the total inhom + defect. When
+    //! interior is given (nodal mask, 0 = patch-boundary node), masked
+    //! nodes are held Dirichlet at the inhom value (defect = 0 there) —
+    //! the FAC patch solve of compositeAMSCorrection.
+    void betaNodalPoissonCG (int lev, MultiFab& phi, MultiFab& q,
+                             MultiFab const* inhom = nullptr,
+                             iMultiFab const* interior = nullptr) const;
+
+    //! The body of averageDownAndSync (average fine solutions down and
+    //! owner-sync every level), shared by the plain path and the
+    //! composite AMS hook which must re-sync after correcting sol.
+    void averageDownAndSyncImpl (Vector<MF>& sol) const;
+
+    //! One pass of the composite beta-weighted auxiliary-space (AMS)
+    //! gradient-channel correction (AMREX_MLCC_AMS, default off): from
+    //! the current composite solution, compute per-level solution
+    //! residuals, assemble the composite nodal charge q = -div(r)
+    //! (uncovered-edge divergence per level plus charge-preserving
+    //! full-weighted restriction of the finer level's charge), solve
+    //! -div(beta grad phi) = q compositely (FAC: domain solve at level
+    //! 0, patch defect solves with interface nodes Dirichlet on the
+    //! interpolated coarser potential), and correct
+    //! sol += damp * grad(phi) on every level. All inputs are linear in
+    //! true residuals, so the correction vanishes at the exact discrete
+    //! solution for any aux-solve quality: it changes rates and bias
+    //! footprints, never the fixed point. See
+    //! Tests/LinearSolvers/CurlCurl_AMR/CURLCURL_AMR_AMS_DESIGN.md.
+    void compositeAMSCorrection (Vector<MF>& sol) const;
 
     //! Build fine coverage masks for all AMR levels except the finest.
     void buildFineMask ();
@@ -319,6 +348,14 @@ private:
     mutable Vector<Array<MultiFab,3>> m_kstash_crse;
     mutable Vector<Array<MultiFab,3>> m_kstash_fine;
     mutable Vector<int> m_kstash_valid;
+
+    //! Per-level rhs copies (x/y components) for the composite AMS
+    //! correction: stashed by reflux each down-leg (copies, because
+    //! MLMG::apply and MLMG::computeResidual pass temporaries),
+    //! consumed by compositeAMSCorrection at the end of the same
+    //! iteration's averageDownAndSync. [amrlev][idim], idim < 2.
+    mutable Vector<Array<MultiFab,3>> m_ams_rhs;
+    mutable Vector<int> m_ams_rhs_valid;
 
     //! True while the outer Krylov matrix action is being applied
     //! (begin/endMatrixApply); selects the second-order CF-ghost
