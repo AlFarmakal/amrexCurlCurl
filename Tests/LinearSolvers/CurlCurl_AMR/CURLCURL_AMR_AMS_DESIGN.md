@@ -176,3 +176,78 @@ No-regression (AMS unset → bit-identical):
 * tight `composite=2` 167 it → 4.493342797e-8; shifted `composite=2`
   err 0.499;
 * 3L manufactured (KCHARGE=0) 43/164 it; LBL (`composite=0`) unchanged.
+
+---
+
+## Implementation results & findings (what landed)
+
+`AMREX_MLCC_AMS=1` (default 0) enables one composite gradient-channel
+pass per MLMG `oneIter`, hooked at the end of `averageDownAndSync`. The
+charge is the divergence of the charge-consistent reference field
+`rhs − β∘sol` (never an `apply`-based residual — see finding 1), solved
+by a composite FAC (`betaNodalPoissonCG`: level-0 domain solve + finer
+patch-defect solves with the interpolated coarser potential as Dirichlet
+data and a buffer band), and applied as `sol += damp·grad(phi)`.
+
+**Verified bit-identical with AMS off** across the full no-regression
+matrix above — the feature is zero-risk to existing behavior.
+
+**Where AMS helps (gated on):**
+| case | baseline | AMS=1 |
+|---|---|---|
+| tube tight 2L `composite=1` | 47 it → 9.41e-8 | **26 it → 7.90e-8** |
+| manufactured 3L rect (KCHARGE=0) | 43 it | **23 it** |
+| manufactured L-pocket 3L (KCHARGE=0) | 164 it | **58 it** |
+
+**Where AMS does NOT yet help (primary goal, unmet):**
+* tube-3L `band=0.1 composite=1`: AMS floors at ~2.6e-5, *above* the
+  KCHARGE baseline 1.04e-6 — AMS is not beneficial on the β-contrast
+  3-level staircase and should stay off there.
+* 2-level/3-level `composite=2` (GMRES): AMS-in-preconditioner is
+  bounded but does not beat the matched-operator baseline (167 it).
+
+### Findings (root-caused this session)
+
+1. **The gradient charge must come from `rhs − β∘sol`, never from a
+   `b − A(sol)` residual.** `div∘(α curl curl) ≡ 0` identically, so
+   `div(r) = div(rhs − β∘sol)` — but only if you never assemble the
+   curl-curl term. Taking the divergence of an `apply`-based residual
+   re-introduces the Part-1 spurious CF-corner charge (the asymmetric
+   assembly's boundary term), which the nodal solve amplifies by `1/β`.
+   An early `apply`-based version diverged ~`1/β` per iteration on the
+   β-contrast tube and in the Krylov preconditioner (where the pocket
+   symmetrization is inert). This was the decisive fix that made the
+   2-level GMRES bounded again. The composite charge must likewise be a
+   *single field's* divergence (`divUncov(ref) + R(q_fine)`, the FAC
+   nodal rhs); a node-charge restriction that drops the interface
+   boundary term re-creates the same `O(rhs/h)` spurious ring charge.
+
+2. **The remaining 3-level β-contrast floor is an architectural limit of
+   the per-level-kernel correction, not a tuning issue.** The post-cycle
+   additive correction `E += grad(phi)` only stays out of the assembled
+   composite curl-curl's range if it is *exactly* curl-conforming there,
+   i.e. `grad(phi)` must be a composite gradient satisfying
+   `P G_c = G_f P_n`. A per-level patch FAC produces a continuous `phi`
+   but `avg-down ∘ P ≠ I` at the middle CF interface, so the correction
+   has a kink there → a curl-channel charge → `1/β`-amplified by the
+   middle level's *partial* solve (exactly the Part-4 mechanism). At
+   β = 1 the amplification is unity and AMS converges fully (manufactured
+   cases); at the wall contrast it sets the floor. Confirmed by: the
+   uniform-η tube has no such blow-up; a buffer band on the patch defect
+   does not move the floor; pure curl-conforming prolongation (no fine
+   defect) discards the fine gradient detail the 2-level needs and
+   stalls.
+
+   **The structural cure is a true composite/Galerkin nodal operator**
+   (e.g. an `MLNodeLaplacian`-style FAC where `avg-down ∘ P` consistency
+   is built into the operator), so that `grad(phi)` lies in the exact
+   discrete kernel at every interface. `betaNodalPoissonCG` (now with
+   the inhomogeneous-boundary / interior-mask patch-defect mode) and the
+   charge-consistent reference assembly are the landed building blocks
+   for that next step.
+
+### Env gates
+
+`AMREX_MLCC_AMS` (0), `AMREX_MLCC_AMS_PASSES` (1),
+`AMREX_MLCC_AMS_DAMP` (1.0), `AMREX_MLCC_AMS_BUFFER` (2 fine cells),
+`AMREX_MLCC_AMS_VERBOSE` (0).
